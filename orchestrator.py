@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import re
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, cast
 
@@ -144,6 +145,116 @@ def _extract_json_object(text: str) -> str:
     return stripped
 
 
+# ---------------------------------------------------------------------------
+# Token & Cost Tracking
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class CallMetrics:
+    """Usage data captured from a single LLM call."""
+
+    stage: str
+    model: str
+    prompt_tokens: int
+    completion_tokens: int
+    total_tokens: int
+    cost_usd: float
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "stage": self.stage,
+            "model": self.model,
+            "prompt_tokens": self.prompt_tokens,
+            "completion_tokens": self.completion_tokens,
+            "total_tokens": self.total_tokens,
+            "cost_usd": self.cost_usd,
+        }
+
+
+@dataclass
+class PipelineMetrics:
+    """Accumulates token usage and cost across all LLM calls in one pipeline run."""
+
+    calls: list[CallMetrics] = field(default_factory=list)
+
+    @property
+    def has_usage(self) -> bool:
+        return bool(self.calls)
+
+    @property
+    def total_prompt_tokens(self) -> int:
+        return sum(c.prompt_tokens for c in self.calls)
+
+    @property
+    def total_completion_tokens(self) -> int:
+        return sum(c.completion_tokens for c in self.calls)
+
+    @property
+    def total_tokens(self) -> int:
+        return sum(c.total_tokens for c in self.calls)
+
+    @property
+    def total_cost_usd(self) -> float:
+        return sum(c.cost_usd for c in self.calls)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "has_usage": self.has_usage,
+            "total_prompt_tokens": self.total_prompt_tokens,
+            "total_completion_tokens": self.total_completion_tokens,
+            "total_tokens": self.total_tokens,
+            "total_cost_usd": self.total_cost_usd,
+            "calls": [c.to_dict() for c in self.calls],
+        }
+
+
+def _compute_cost(response: Any) -> float:
+    """Defensively compute USD cost from a LiteLLM response.
+
+    Returns 0.0 if ``response`` is None, if pricing data is unavailable,
+    the model is unknown to LiteLLM, or any other exception occurs.
+    """
+    if response is None:
+        return 0.0
+    try:
+        return float(litellm.completion_cost(completion_response=response))
+    except Exception:  # noqa: BLE001
+        return 0.0
+
+
+def _extract_call_metrics(
+    response: Any,
+    model: str,
+    stage: str,
+) -> CallMetrics | None:
+    """Defensively extract a CallMetrics from a LiteLLM response.
+
+    Returns None if ``response`` is None or lacks a ``usage`` attribute,
+    meaning no real token data is available (e.g. a test mock without usage).
+    """
+    if response is None:
+        return None
+    usage = getattr(response, "usage", None)
+    if usage is None:
+        return None
+    try:
+        prompt_tokens = int(getattr(usage, "prompt_tokens", 0) or 0)
+        completion_tokens = int(getattr(usage, "completion_tokens", 0) or 0)
+        total_tokens = int(getattr(usage, "total_tokens", 0) or 0)
+    except (TypeError, ValueError):
+        return None
+    cost = _compute_cost(response)
+    return CallMetrics(
+        stage=stage,
+        model=model,
+        prompt_tokens=prompt_tokens,
+        completion_tokens=completion_tokens,
+        total_tokens=total_tokens,
+        cost_usd=cost,
+    )
+
+
 class ContractValidationResult:
     """Result of deterministic Prompt Contract v1 structural validation.
 
@@ -266,7 +377,16 @@ def _provider_call_kwargs() -> dict[str, Any]:
     return kwargs
 
 
-async def _call_llm(model: str, messages: list[dict[str, Any]], timeout: float) -> str:
+async def _call_llm(
+    model: str, messages: list[dict[str, Any]], timeout: float
+) -> tuple[str, Any]:
+    """Call the LLM and return ``(content, raw_response)``.
+
+    ``raw_response`` is the :class:`~litellm.types.utils.ModelResponse` object
+    returned by LiteLLM, which may carry a ``.usage`` attribute for token
+    accounting. It is ``None`` if the call fails (in which case
+    :exc:`LLMCallError` is raised instead of returning).
+    """
     try:
         provider_kwargs = _provider_call_kwargs()
     except ValueError as exc:
@@ -285,11 +405,13 @@ async def _call_llm(model: str, messages: list[dict[str, Any]], timeout: float) 
 
     response = cast(ModelResponse, raw_response)
     try:
-        return response["choices"][0]["message"]["content"]
+        content = response["choices"][0]["message"]["content"]
     except (KeyError, IndexError, TypeError) as exc:
         raise LLMCallError(
             f"Unexpected LLM response shape from '{model}': {exc}"
         ) from exc
+
+    return content, response
 
 
 async def _get_structured_response(
@@ -297,18 +419,30 @@ async def _get_structured_response(
     messages: list[dict[str, Any]],
     schema: type[BaseModel],
     timeout: float,
-) -> BaseModel:
-    """Call the model and parse its reply into ``schema``.
+    stage: str = "",
+) -> tuple[BaseModel, list[CallMetrics]]:
+    """Call the model, parse its reply into ``schema``, and return accumulated metrics.
 
     If the first reply is not valid JSON matching the schema, makes exactly
-    one repair call asking the same model to return only valid JSON.
+    one repair call asking the same model to return only valid JSON. Both the
+    initial call and any repair call are counted in the returned
+    ``list[CallMetrics]`` — neither is silently dropped.
+
+    Returns ``(parsed_schema_object, call_metrics_list)``.
     """
-    raw = await _call_llm(model, messages, timeout)
+    call_metrics: list[CallMetrics] = []
+
+    raw, response = await _call_llm(model, messages, timeout)
+    cm = _extract_call_metrics(response, model, stage)
+    if cm is not None:
+        call_metrics.append(cm)
+
     try:
-        return schema.model_validate_json(_extract_json_object(raw))
+        return schema.model_validate_json(_extract_json_object(raw)), call_metrics
     except (ValidationError, ValueError):
         pass
 
+    repair_stage = f"{stage}_repair" if stage else "repair"
     repair_messages = messages + [
         {"role": "assistant", "content": raw},
         {
@@ -320,9 +454,16 @@ async def _get_structured_response(
             ),
         },
     ]
-    repaired_raw = await _call_llm(model, repair_messages, timeout)
+    repaired_raw, repair_response = await _call_llm(model, repair_messages, timeout)
+    repair_cm = _extract_call_metrics(repair_response, model, repair_stage)
+    if repair_cm is not None:
+        call_metrics.append(repair_cm)
+
     try:
-        return schema.model_validate_json(_extract_json_object(repaired_raw))
+        return (
+            schema.model_validate_json(_extract_json_object(repaired_raw)),
+            call_metrics,
+        )
     except (ValidationError, ValueError) as exc:
         raise JSONRepairError(
             f"Model '{model}' failed to produce valid JSON matching "
@@ -358,21 +499,27 @@ async def run_architect(
     model: str,
     timeout: float,
     feedback: RefereeReview | None = None,
-) -> ArchitectDraft:
+    stage: str = "architect_draft",
+) -> tuple[ArchitectDraft, list[CallMetrics]]:
+    """Run the Architect and return ``(draft, call_metrics_list)``."""
     messages = [
         {"role": "system", "content": ARCHITECT_SYSTEM_PROMPT},
         {"role": "user", "content": _build_architect_user_message(task, context, feedback)},
     ]
-    draft = await _get_structured_response(model, messages, ArchitectDraft, timeout)
-    assert isinstance(draft, ArchitectDraft)
-    return draft
+    result, call_metrics = await _get_structured_response(
+        model, messages, ArchitectDraft, timeout, stage=stage
+    )
+    assert isinstance(result, ArchitectDraft)
+    return result, call_metrics
 
 
 async def run_referee(
     draft: ArchitectDraft,
     model: str,
     timeout: float,
-) -> RefereeReview:
+    stage: str = "referee_review",
+) -> tuple[RefereeReview, list[CallMetrics]]:
+    """Run the Referee and return ``(review, call_metrics_list)``."""
     messages = [
         {"role": "system", "content": REFEREE_SYSTEM_PROMPT},
         {
@@ -383,9 +530,11 @@ async def run_referee(
             ),
         },
     ]
-    review = await _get_structured_response(model, messages, RefereeReview, timeout)
-    assert isinstance(review, RefereeReview)
-    return review
+    result, call_metrics = await _get_structured_response(
+        model, messages, RefereeReview, timeout, stage=stage
+    )
+    assert isinstance(result, RefereeReview)
+    return result, call_metrics
 
 
 def _contract_violation_review(result: ContractValidationResult) -> RefereeReview:
@@ -411,7 +560,8 @@ async def _review_with_contract_gate(
     draft: ArchitectDraft,
     referee_model: str,
     timeout: float,
-) -> RefereeReview:
+    stage: str = "referee_review",
+) -> tuple[RefereeReview, list[CallMetrics]]:
     """Enforce Prompt Contract v1 structure before invoking the Referee LLM.
 
     Runs the deterministic, local ``validate_prompt_contract`` check first. If
@@ -420,11 +570,14 @@ async def _review_with_contract_gate(
     rejection. Only structurally valid drafts are sent to the real Referee,
     which remains responsible for semantic judgement (meta-prompt detection,
     contradictions, invented facts).
+
+    Returns ``(review, call_metrics_list)``. The metrics list is empty when the
+    contract gate short-circuits (no LLM call was made).
     """
     contract_result = validate_prompt_contract(draft.zed_prompt)
     if not contract_result.is_valid:
-        return _contract_violation_review(contract_result)
-    return await run_referee(draft, referee_model, timeout)
+        return _contract_violation_review(contract_result), []
+    return await run_referee(draft, referee_model, timeout, stage=stage)
 
 
 _NO_FALLBACK_TEXT = (
@@ -472,6 +625,19 @@ def write_zed_prompt(content: str, zed_dir: str | Path = config.ZED_DIR) -> Path
     return prompt_path
 
 
+def _format_cost(cost_usd: float) -> str:
+    """Format a USD cost value for display, preserving small non-zero values.
+
+    Uses Python's ``g`` format to avoid scientific notation for typical LLM
+    costs while showing enough significant digits to be meaningful (e.g.
+    ``$0.00042`` instead of ``$0.00`` or ``$4.2e-04``).
+    """
+    if cost_usd == 0.0:
+        return "$0.00000"
+    # 5 significant figures avoids scientific notation for costs down to ~$0.0001
+    return f"${cost_usd:.5g}"
+
+
 def _format_review_markdown(info: dict[str, Any]) -> str:
     lines = ["# VCF Review", "", f"**Status:** {info.get('status', 'UNKNOWN')}", ""]
 
@@ -499,6 +665,38 @@ def _format_review_markdown(info: dict[str, Any]) -> str:
         lines.append(json.dumps(draft, indent=2, ensure_ascii=False))
         lines.append("```")
         lines.append("")
+
+    # --- Run Metrics ---------------------------------------------------------
+    # Placed immediately before the Suggested Fallback Prompt section.
+    lines += ["---", "", "### \U0001f4ca Run Metrics", ""]
+    metrics: dict[str, Any] = info.get("metrics", {})
+    if metrics.get("has_usage"):
+        lines += [
+            "| Metric | Value |",
+            "|--------|-------|",
+            f"| Prompt tokens | {metrics['total_prompt_tokens']:,} |",
+            f"| Completion tokens | {metrics['total_completion_tokens']:,} |",
+            f"| Total tokens | {metrics['total_tokens']:,} |",
+            f"| Estimated cost | {_format_cost(metrics['total_cost_usd'])} |",
+            "",
+        ]
+        calls: list[dict[str, Any]] = metrics.get("calls", [])
+        if len(calls) > 1:
+            lines += [
+                "#### Per-Stage Breakdown",
+                "",
+                "| Stage | Model | Prompt | Completion | Total | Cost |",
+                "|-------|-------|--------|------------|-------|------|",
+            ]
+            for c in calls:
+                lines.append(
+                    f"| {c['stage']} | {c['model']} "
+                    f"| {c['prompt_tokens']:,} | {c['completion_tokens']:,} "
+                    f"| {c['total_tokens']:,} | {_format_cost(c['cost_usd'])} |"
+                )
+            lines.append("")
+    else:
+        lines += ["No token/cost data available for this run.", ""]
 
     # --- Fallback Prompt -------------------------------------------------
     # Always present so the developer has a ready-to-use starting point
@@ -569,6 +767,10 @@ async def run_pipeline(
     attempt, invalid JSON after repair, or an API/timeout error), the
     existing ``prompt.md`` is left untouched and diagnostics are written to
     ``<zed_dir>/review.md`` instead.
+
+    Token usage and estimated USD cost are accumulated across every LLM call
+    made during the run. Partial metrics (from calls that succeeded before an
+    error) are preserved even on the ERROR path.
     """
     architect_model = architect_model or config.ARCHITECT_MODEL
     referee_model = referee_model or config.REFEREE_MODEL
@@ -576,18 +778,29 @@ async def run_pipeline(
 
     diagnostic_info: dict[str, Any] = {"task": task, "drafts": [], "reviews": []}
 
+    # Instantiated BEFORE the try block so the accumulator survives into the
+    # except handler and partial metrics from successful calls are not lost.
+    metrics = PipelineMetrics()
+
     try:
         context = load_ssot_context(context_dir)
 
-        draft = await run_architect(task, context, architect_model, timeout)
+        draft, draft1_metrics = await run_architect(
+            task, context, architect_model, timeout, stage="architect_draft_1"
+        )
+        metrics.calls.extend(draft1_metrics)
         diagnostic_info["drafts"].append(draft.model_dump())
 
         # Prompt Contract v1 structural gate: a draft that deterministically
         # fails it is rejected without spending a Referee LLM call.
-        review = await _review_with_contract_gate(draft, referee_model, timeout)
+        review, review1_metrics = await _review_with_contract_gate(
+            draft, referee_model, timeout, stage="referee_review_1"
+        )
+        metrics.calls.extend(review1_metrics)
         diagnostic_info["reviews"].append(review.model_dump())
 
         if review.status == "APPROVED":
+            diagnostic_info["metrics"] = metrics.to_dict()
             failure = _finalize_approved(draft, diagnostic_info, zed_dir)
             if failure is not None:
                 return failure
@@ -600,15 +813,21 @@ async def run_pipeline(
 
         # Single fix cycle: give the Architect the Referee's feedback, then
         # re-verify with a mandatory second Referee pass (also contract-gated).
-        fixed_draft = await run_architect(
-            task, context, architect_model, timeout, feedback=review
+        fixed_draft, draft2_metrics = await run_architect(
+            task, context, architect_model, timeout, feedback=review,
+            stage="architect_draft_2"
         )
+        metrics.calls.extend(draft2_metrics)
         diagnostic_info["drafts"].append(fixed_draft.model_dump())
 
-        second_review = await _review_with_contract_gate(fixed_draft, referee_model, timeout)
+        second_review, review2_metrics = await _review_with_contract_gate(
+            fixed_draft, referee_model, timeout, stage="referee_review_2"
+        )
+        metrics.calls.extend(review2_metrics)
         diagnostic_info["reviews"].append(second_review.model_dump())
 
         if second_review.status == "APPROVED":
+            diagnostic_info["metrics"] = metrics.to_dict()
             failure = _finalize_approved(fixed_draft, diagnostic_info, zed_dir)
             if failure is not None:
                 return failure
@@ -620,12 +839,16 @@ async def run_pipeline(
             )
 
         diagnostic_info["status"] = "REJECT"
+        diagnostic_info["metrics"] = metrics.to_dict()
         write_review(diagnostic_info, zed_dir)
         return RunResult(final_prompt=None, status="REJECT", diagnostic_info=diagnostic_info)
 
     except (LLMCallError, JSONRepairError, OSError) as exc:
         diagnostic_info["status"] = "ERROR"
         diagnostic_info["error"] = str(exc)
+        # Preserve any partial metrics accumulated before the failure so the
+        # review.md Run Metrics section is not empty if some calls succeeded.
+        diagnostic_info["metrics"] = metrics.to_dict()
         try:
             write_review(diagnostic_info, zed_dir)
         except OSError:

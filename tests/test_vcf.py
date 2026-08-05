@@ -13,6 +13,7 @@ import asyncio
 import json
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
@@ -75,9 +76,46 @@ def review_json(
     )
 
 
-def llm_response(content: str) -> dict[str, object]:
-    """Shape mimicking a LiteLLM ModelResponse's dict-style access."""
-    return {"choices": [{"message": {"content": content}}]}
+def make_usage(
+    prompt_tokens: int = 0,
+    completion_tokens: int = 0,
+    total_tokens: int = 0,
+) -> SimpleNamespace:
+    """Build a mock ``.usage`` object mimicking LiteLLM's Usage type."""
+    return SimpleNamespace(
+        prompt_tokens=prompt_tokens,
+        completion_tokens=completion_tokens,
+        total_tokens=total_tokens,
+    )
+
+
+class _MockResponse:
+    """Mock object that supports both dict-item access (for content extraction)
+    and attribute access (for ``.usage`` and cost helpers).
+
+    This mirrors the interface of ``litellm.types.utils.ModelResponse`` as used
+    by ``_call_llm`` (``response["choices"][...]``) and the new token-tracking
+    helpers (``getattr(response, "usage", None)``).
+    """
+
+    def __init__(self, data: dict, usage: SimpleNamespace | None = None) -> None:
+        self._data = data
+        self.usage = usage
+
+    def __getitem__(self, key: str):  # type: ignore[override]
+        return self._data[key]
+
+
+def llm_response(content: str, usage: SimpleNamespace | None = None) -> _MockResponse:
+    """Build a mock LiteLLM response supporting item and attribute access.
+
+    ``usage`` is an optional ``SimpleNamespace(prompt_tokens=...,
+    completion_tokens=..., total_tokens=...)`` for tests that need to verify
+    token accumulation. When omitted (``None``), the response behaves like a
+    mock without usage data (graceful fallback path).
+    """
+    data = {"choices": [{"message": {"content": content}}]}
+    return _MockResponse(data, usage=usage)
 
 
 def run_pipeline(task: str, **kwargs):
@@ -855,3 +893,241 @@ class TestSuggestedFallbackPrompt:
         fallback_section = content.split(self.FALLBACK_HEADING)[-1]
         assert non_compliant in fallback_section
         assert "```" in fallback_section
+
+
+class TestCostAndTokenTracking:
+    """Verify that token usage and cost are correctly accumulated and reported.
+
+    All tests use mock responses without real LLM calls. Usage objects are
+    attached to mock responses via the ``usage`` parameter of ``llm_response``.
+    """
+
+    METRICS_HEADING = "### 📊 Run Metrics"
+    FALLBACK_HEADING = "### 💡 Suggested Fallback Prompt"
+
+    def _make_usage(self, p: int, c: int, t: int) -> SimpleNamespace:
+        return make_usage(prompt_tokens=p, completion_tokens=c, total_tokens=t)
+
+    def test_tokens_accumulated_across_multiple_calls(self, tmp_path, monkeypatch):
+        """Token counts from all LLM calls are summed in diagnostic_info['metrics']."""
+        arch_usage = self._make_usage(100, 50, 150)
+        ref_usage = self._make_usage(200, 80, 280)
+        mock = AsyncMock(
+            side_effect=[
+                llm_response(draft_json(prompt=compliant_prompt("v1")), usage=arch_usage),
+                llm_response(review_json(status="REJECT"), usage=ref_usage),
+                llm_response(draft_json(prompt=compliant_prompt("v2")), usage=arch_usage),
+                llm_response(review_json(status="REJECT"), usage=ref_usage),
+            ]
+        )
+        monkeypatch.setattr(orchestrator.litellm, "acompletion", mock)
+
+        zed_dir = tmp_path / ".zed"
+        result = run_pipeline(
+            "task",
+            architect_model="fake/architect",
+            referee_model="fake/referee",
+            context_dir=tmp_path,
+            zed_dir=zed_dir,
+        )
+
+        assert result.status == "REJECT"
+        metrics = result.diagnostic_info["metrics"]
+        assert metrics["has_usage"] is True
+        # 2 architect calls (150 each) + 2 referee calls (280 each) = 860 total
+        assert metrics["total_prompt_tokens"] == 100 + 200 + 100 + 200
+        assert metrics["total_completion_tokens"] == 50 + 80 + 50 + 80
+        assert metrics["total_tokens"] == 150 + 280 + 150 + 280
+        assert len(metrics["calls"]) == 4
+
+    def test_repair_call_usage_included_in_totals(self, tmp_path, monkeypatch):
+        """Usage from a JSON-repair call is counted in the pipeline metrics."""
+        invalid = '{"zed_prompt": "incomplete", "relevant_files": ['
+        arch_usage = self._make_usage(100, 50, 150)
+        repair_usage = self._make_usage(120, 60, 180)
+        ref_usage = self._make_usage(200, 80, 280)
+        mock = AsyncMock(
+            side_effect=[
+                llm_response(invalid, usage=arch_usage),          # architect draft: malformed
+                llm_response(
+                    draft_json(prompt=compliant_prompt("fixed")),
+                    usage=repair_usage,
+                ),  # repair call
+                llm_response(review_json(status="APPROVED"), usage=ref_usage),  # referee
+            ]
+        )
+        monkeypatch.setattr(orchestrator.litellm, "acompletion", mock)
+
+        zed_dir = tmp_path / ".zed"
+        result = run_pipeline(
+            "task",
+            architect_model="fake/architect",
+            referee_model="fake/referee",
+            context_dir=tmp_path,
+            zed_dir=zed_dir,
+        )
+
+        assert result.status == "APPROVED"
+        metrics = result.diagnostic_info["metrics"]
+        assert metrics["has_usage"] is True
+        # All three calls must be counted: original + repair + referee.
+        assert metrics["total_tokens"] == 150 + 180 + 280
+        assert len(metrics["calls"]) == 3
+        # Repair call stage label must contain "repair".
+        stages = [c["stage"] for c in metrics["calls"]]
+        assert any("repair" in s for s in stages)
+
+    def test_graceful_fallback_when_no_usage_data(self, tmp_path, monkeypatch):
+        """When no mocked response carries .usage, review.md shows the fallback text."""
+        mock = AsyncMock(
+            side_effect=[
+                llm_response(draft_json(prompt=compliant_prompt("v1"))),   # no usage
+                llm_response(review_json(status="REJECT")),                # no usage
+                llm_response(draft_json(prompt=compliant_prompt("v2"))),   # no usage
+                llm_response(review_json(status="REJECT")),                # no usage
+            ]
+        )
+        monkeypatch.setattr(orchestrator.litellm, "acompletion", mock)
+
+        zed_dir = tmp_path / ".zed"
+        result = run_pipeline(
+            "task",
+            architect_model="fake/architect",
+            referee_model="fake/referee",
+            context_dir=tmp_path,
+            zed_dir=zed_dir,
+        )
+
+        assert result.status == "REJECT"
+        metrics = result.diagnostic_info["metrics"]
+        assert metrics["has_usage"] is False
+
+        content = (zed_dir / "review.md").read_text(encoding="utf-8")
+        assert "No token/cost data available for this run." in content
+
+    def test_run_metrics_section_present_in_review_md(self, tmp_path, monkeypatch):
+        """The ### 📊 Run Metrics section must appear in review.md on REJECT paths."""
+        mock = AsyncMock(
+            side_effect=[
+                llm_response(draft_json(prompt=compliant_prompt("v1"))),
+                llm_response(review_json(status="REJECT")),
+                llm_response(draft_json(prompt=compliant_prompt("v2"))),
+                llm_response(review_json(status="REJECT")),
+            ]
+        )
+        monkeypatch.setattr(orchestrator.litellm, "acompletion", mock)
+
+        zed_dir = tmp_path / ".zed"
+        run_pipeline(
+            "task",
+            architect_model="fake/architect",
+            referee_model="fake/referee",
+            context_dir=tmp_path,
+            zed_dir=zed_dir,
+        )
+
+        content = (zed_dir / "review.md").read_text(encoding="utf-8")
+        assert self.METRICS_HEADING in content
+
+    def test_run_metrics_section_positioned_before_fallback_prompt(self, tmp_path, monkeypatch):
+        """### 📊 Run Metrics must appear before ### 💡 Suggested Fallback Prompt."""
+        mock = AsyncMock(
+            side_effect=[
+                llm_response(draft_json(prompt=compliant_prompt("v1"))),
+                llm_response(review_json(status="REJECT")),
+                llm_response(draft_json(prompt=compliant_prompt("v2"))),
+                llm_response(review_json(status="REJECT")),
+            ]
+        )
+        monkeypatch.setattr(orchestrator.litellm, "acompletion", mock)
+
+        zed_dir = tmp_path / ".zed"
+        run_pipeline(
+            "task",
+            architect_model="fake/architect",
+            referee_model="fake/referee",
+            context_dir=tmp_path,
+            zed_dir=zed_dir,
+        )
+
+        content = (zed_dir / "review.md").read_text(encoding="utf-8")
+        metrics_pos = content.index(self.METRICS_HEADING)
+        fallback_pos = content.index(self.FALLBACK_HEADING)
+        assert metrics_pos < fallback_pos, (
+            "### 📊 Run Metrics must appear before ### 💡 Suggested Fallback Prompt"
+        )
+
+    def test_partial_metrics_preserved_on_error_path(self, tmp_path, monkeypatch):
+        """Metrics from successful calls before the error are included in review.md."""
+        arch_usage = self._make_usage(100, 50, 150)
+        mock = AsyncMock(
+            side_effect=[
+                llm_response(draft_json(prompt=compliant_prompt("v1")), usage=arch_usage),
+                RuntimeError("simulated referee failure"),
+            ]
+        )
+        monkeypatch.setattr(orchestrator.litellm, "acompletion", mock)
+
+        zed_dir = tmp_path / ".zed"
+        result = run_pipeline(
+            "task",
+            architect_model="fake/architect",
+            referee_model="fake/referee",
+            context_dir=tmp_path,
+            zed_dir=zed_dir,
+        )
+
+        assert result.status == "ERROR"
+        metrics = result.diagnostic_info["metrics"]
+        # The Architect call succeeded before the Referee raised; its usage
+        # must be preserved in the accumulated metrics.
+        assert metrics["has_usage"] is True
+        assert metrics["total_tokens"] == 150
+        assert len(metrics["calls"]) == 1
+
+        content = (zed_dir / "review.md").read_text(encoding="utf-8")
+        # Run Metrics section must show real data, not the fallback text.
+        assert "No token/cost data available for this run." not in content
+        assert self.METRICS_HEADING in content
+
+    def test_cli_summary_line_printed_with_usage(self, tmp_path, monkeypatch, capsys):
+        """The [VCF] summary line is printed to stdout with token count and cost."""
+        monkeypatch.chdir(tmp_path)
+        arch_usage = self._make_usage(100, 50, 150)
+        ref_usage = self._make_usage(200, 80, 280)
+        mock = AsyncMock(
+            side_effect=[
+                llm_response(draft_json(prompt=compliant_prompt("ok")), usage=arch_usage),
+                llm_response(review_json(status="APPROVED"), usage=ref_usage),
+            ]
+        )
+        monkeypatch.setattr(orchestrator.litellm, "acompletion", mock)
+        # Prevent completion_cost from making network calls; just return 0.
+        monkeypatch.setattr(orchestrator.litellm, "completion_cost", lambda **_: 0.0)
+
+        exit_code = vcf.main(
+            ["task", "--architect-model", "fake/a", "--referee-model", "fake/r"]
+        )
+
+        assert exit_code == 0
+        captured = capsys.readouterr()
+        assert "[VCF] Tokens used: 430" in captured.out
+
+    def test_cli_summary_line_unavailable_without_usage(self, tmp_path, monkeypatch, capsys):
+        """When no usage data is present, the CLI prints 'unavailable'."""
+        monkeypatch.chdir(tmp_path)
+        mock = AsyncMock(
+            side_effect=[
+                llm_response(draft_json(prompt=compliant_prompt("ok"))),
+                llm_response(review_json(status="APPROVED")),
+            ]
+        )
+        monkeypatch.setattr(orchestrator.litellm, "acompletion", mock)
+
+        exit_code = vcf.main(
+            ["task", "--architect-model", "fake/a", "--referee-model", "fake/r"]
+        )
+
+        assert exit_code == 0
+        captured = capsys.readouterr()
+        assert "[VCF] Tokens used: unavailable" in captured.out

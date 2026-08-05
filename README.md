@@ -254,9 +254,45 @@ On **failure** (status = `REJECT` or `ERROR`):
   - All Referee reviews and critiques
   - Error messages (if any)
   - Feedback and required changes
+  - **`### 📊 Run Metrics`** — token usage and cost summary (see below)
   - **`### 💡 Suggested Fallback Prompt`** — a ready-to-use prompt at the end of the file (see below)
 
 The existing `.zed/prompt.md` is **never** overwritten on failure, preserving the last approved prompt.
+
+A one-line token/cost summary is also printed to stdout at the end of every run, regardless of outcome:
+
+```
+[VCF] Tokens used: 1,420 | Est. cost: $0.00035
+```
+
+If no usage data was available (e.g. a mock response without a `.usage` attribute), this line instead reads:
+
+```
+[VCF] Tokens used: unavailable
+```
+
+#### Run Metrics
+
+Every `review.md` produced on a `REJECT` or `ERROR` path includes a
+`### 📊 Run Metrics` section positioned immediately before the Suggested
+Fallback Prompt. The section contains:
+
+- **Total token counts** — prompt tokens, completion tokens, and total tokens
+  summed across every LLM call made during the run (including any JSON-repair
+  calls).
+- **Estimated cost in USD** — computed via `litellm.completion_cost()`, formatted
+  to preserve small values (e.g. `$0.00042` not `$0.00`). Defaults to `$0.00000`
+  if pricing data is unavailable for the model.
+- **Per-stage breakdown** (when more than one call occurred) — one row per call
+  with stage label, model, per-call token counts, and per-call cost.
+
+If no usage data was available for any call during the run (e.g. all responses
+lacked a `.usage` attribute), the section renders:
+
+> No token/cost data available for this run.
+
+Partial metrics from calls that succeeded before an error are preserved even on
+the `ERROR` path — they are never silently discarded.
 
 #### Suggested Fallback Prompt
 
@@ -306,7 +342,7 @@ pytest tests/test_vcf.py::TestApprovedFlow::test_approved_on_first_pass -v
 
 ### Test Coverage
 
-- **33 comprehensive unit tests** covering:
+- **41 comprehensive unit tests** covering:
   - Approved flow (first pass and after one fix cycle)
   - Reject flow (after fix attempt, prompt preservation)
   - JSON repair (malformed responses, recovery)
@@ -315,6 +351,7 @@ pytest tests/test_vcf.py::TestApprovedFlow::test_approved_on_first_pass -v
   - Provider configuration (default and AgentRouter modes)
   - Error handling (LLM failures, timeouts)
   - Suggested Fallback Prompt resolution (Referee suggestion, last draft, no-fallback sentinel)
+  - **Cost & Token Tracking** — accumulation across multiple calls, JSON-repair call inclusion, graceful fallback when no usage data, `### 📊 Run Metrics` section presence and ordering, partial metrics preserved on error path, CLI summary line
 
 All tests are **fully isolated**: no real LLM calls, no real network I/O. LiteLLM is monkeypatched with `AsyncMock`, and filesystem operations use pytest's `tmp_path` fixture.
 
