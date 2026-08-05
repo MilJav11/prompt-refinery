@@ -342,7 +342,7 @@ pytest tests/test_vcf.py::TestApprovedFlow::test_approved_on_first_pass -v
 
 ### Test Coverage
 
-- **41 comprehensive unit tests** covering:
+- **41 comprehensive unit tests** in `tests/test_vcf.py` and **12 MCP server tests** in `tests/test_mcp_server.py` (**53 total**) covering:
   - Approved flow (first pass and after one fix cycle)
   - Reject flow (after fix attempt, prompt preservation)
   - JSON repair (malformed responses, recovery)
@@ -398,11 +398,88 @@ Architect draft → no-fallback sentinel) implemented in `_resolve_fallback_prom
 
 ---
 
+## MCP Server
+
+VCF ships a [Model Context Protocol](https://spec.modelcontextprotocol.io) server
+(`mcp_server.py`) that exposes the pipeline as a callable tool named
+`refine_prompt`.  IDE agents (Zed, Cursor, Antigravity) can invoke VCF directly
+without the user running `python vcf.py` manually or copy-pasting
+`.zed/prompt.md`.
+
+### `refine_prompt` Tool
+
+**Description:** Runs the full Architect → Referee → fix-cycle pipeline on a
+raw task description and returns a structured result.
+
+**Parameters:**
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `task` | `str` | *(required)* | The raw user task description |
+| `architect_model` | `str \| null` | env default | LiteLLM model ID for the Architect |
+| `referee_model` | `str \| null` | env default | LiteLLM model ID for the Referee |
+| `timeout` | `float \| null` | env default | Per-call LLM timeout in seconds |
+| `context_dir` | `str` | `"."` | Directory to load project context from |
+
+**Return shape:**
+
+```json
+{
+  "status":       "APPROVED" | "REJECT" | "ERROR",
+  "final_prompt": "<approved prompt text>" | null,
+  "summary":      "[VCF] Tokens used: 1,420 | Est. cost: $0.00035",
+  "details_path": "/abs/path/to/.zed/prompt.md",
+  "error":        null
+}
+```
+
+- `details_path` points to `.zed/prompt.md` on `APPROVED`, `.zed/review.md` on `REJECT`/`ERROR`.  
+  The calling IDE agent can read this file directly for full diagnostic detail.
+- API keys and secrets are **never** included in the returned dict.
+
+### Running the Server
+
+For local testing (starts the stdio JSON-RPC server; exit with `Ctrl+C`):
+
+```sh
+python mcp_server.py
+```
+
+The server produces no stdout output when idle — all logging goes to stderr.
+
+### Registering in Zed
+
+Add the following to your Zed `settings.json` (adjust the path to the
+actual location of your `prompt-refinery` checkout):
+
+```json
+{
+  "context_servers": {
+    "prompt-refinery": {
+      "command": {
+        "path": "python",
+        "args": ["/absolute/path/to/prompt-refinery/mcp_server.py"]
+      }
+    }
+  }
+}
+```
+
+### Other MCP-Compatible IDEs
+
+The same `{ "command": { "path": "python", "args": [...] } }` pattern works for
+Cursor, Antigravity, and any other MCP-compatible IDE — only the settings file
+location differs.  Consult your IDE's MCP integration documentation for the
+exact configuration format.
+
+---
+
 ## Dependencies
 
 - **Python 3.11+**
 - **pydantic** (data validation)
 - **litellm** (LLM provider abstraction)
+- **mcp** (MCP Python SDK, 2.0+, for the `mcp_server.py` stdio server)
 - **python-dotenv** (environment variable loading)
 - **pytest** (testing framework; dev dependency)
 

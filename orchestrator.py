@@ -638,6 +638,27 @@ def _format_cost(cost_usd: float) -> str:
     return f"${cost_usd:.5g}"
 
 
+def format_metrics_summary(diagnostic_info: dict[str, Any]) -> str:
+    """Return a one-line human-readable token/cost summary from ``diagnostic_info``.
+
+    This is the single source of truth for the metrics summary string used by
+    both the CLI (``vcf.py``) and the MCP server (``mcp_server.py``).  It reads
+    ``diagnostic_info["metrics"]`` — the dict produced by
+    :meth:`PipelineMetrics.to_dict` — and formats it as a ``[VCF]``-prefixed
+    line suitable for printing or embedding in a tool response.
+
+    Returns ``"[VCF] Tokens used: unavailable"`` when no real usage data is
+    present (e.g. all responses were mocks without a ``.usage`` attribute).
+    Never raises; degrades gracefully on missing or partial data.
+    """
+    metrics = diagnostic_info.get("metrics", {})
+    if not metrics.get("has_usage"):
+        return "[VCF] Tokens used: unavailable"
+    total = metrics.get("total_tokens", 0)
+    cost = metrics.get("total_cost_usd", 0.0)
+    return f"[VCF] Tokens used: {total:,} | Est. cost: {_format_cost(cost)}"
+
+
 def _format_review_markdown(info: dict[str, Any]) -> str:
     lines = ["# VCF Review", "", f"**Status:** {info.get('status', 'UNKNOWN')}", ""]
 
