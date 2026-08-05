@@ -1,0 +1,388 @@
+# Verified Code Factory (VCF)
+
+A **stateless artifact pipeline** that translates raw task descriptions into validated, structured prompts for AI IDE agents. VCF enforces a strict Prompt Contract that ensures every instruction is concrete, implementable, and verifiable.
+
+---
+
+## Overview
+
+VCF runs a deterministic two-stage orchestration loop:
+
+1. **Architect Phase**: Converts a raw user task into a structured prompt draft (with relevant files and assumptions)
+2. **Referee Phase**: Validates the draft against Prompt Contract v1 and performs semantic review
+3. **Fix Cycle** (if rejected): Gives the Architect feedback for one correction attempt
+4. **Finalization**: Writes the approved prompt to `.zed/prompt.md`
+
+The entire pipeline is **stateless** and **deterministic**, making it safe to exercise in unit tests with mocked LLM responses and temporary filesystem directories.
+
+---
+
+## Architect → Referee Flow
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│  User Task + Project Context                                │
+└────────────────────┬─────────────────────────────────────────┘
+                     │
+                     ▼
+         ┌───────────────────────┐
+         │    ARCHITECT DRAFT     │
+         │  (Pydantic-validated)  │
+         └───────────┬───────────┘
+                     │
+                     ▼
+    ┌────────────────────────────────┐
+    │ Prompt Contract v1 Structural  │
+    │ Validation (deterministic)     │
+    └────────┬──────────┬────────────┘
+             │          │
+         Valid       Invalid
+             │          │
+             ▼          ▼
+    ┌──────────────┐  Synthesize REJECT
+    │ Run REFEREE  │  (no LLM call)
+    └──┬─────┬────┘
+       │     │
+    APPROVED REJECT
+       │     │
+       │     ▼
+       │   Feedback Loop
+       │   (1 fix cycle max)
+       │     │
+       │  ARCHITECT DRAFT v2
+       │     │
+       │  Contract Gate
+       │     │
+       │     ▼
+       │  Run REFEREE
+       │     │
+       │  APPROVED or REJECT
+       │     │
+       ▼     ▼
+┌──────────────────────┐
+│  Write prompt.md     │
+│  or review.md        │
+└──────────────────────┘
+```
+
+---
+
+## Prompt Contract v1
+
+Every approved `zed_prompt` must contain exactly four top-level Markdown section headings, in this precise order, each followed by non-empty content:
+
+### Mandatory Sections
+
+1. **`### 🎯 Objective`**  
+   The task to implement. Must be a direct implementation instruction, not a meta-prompt asking for another prompt or plan.
+
+2. **`### 📁 Relevant Files`**  
+   List of file paths likely relevant to the task. May be empty (`[]`) if unknown; if included, must be plausible.
+
+3. **`### ⚙️ Technical Requirements & Constraints`**  
+   Explicit constraints, edge cases, testing requirements, and any mandatory environment or dependency information.
+
+4. **`### 🚀 Step-by-Step Implementation Instructions`**  
+   Numbered or bulleted steps guiding the AI IDE agent through the implementation. Must be concrete and include verification expectations.
+
+### Contract Rules
+
+- **No meta-prompts**: `zed_prompt` must instruct the IDE agent to *do* the work, not describe more work or generate more prompts.
+- **Consistency**: `assumptions` and `relevant_files` must not contradict `zed_prompt`.
+- **Project knowledge**: Never invent file names, libraries, or framework details. If uncertain, instruct the IDE agent to inspect the project first.
+- **Testability**: Each prompt must include clear verification expectations (test suite output, specific file changes, CLI feedback, etc.).
+
+---
+
+## Installation & Setup
+
+### 1. Clone and Install Dependencies
+
+```sh
+pip install -r requirements.txt
+```
+
+### 2. Configure Environment
+
+Copy the example environment file:
+
+```sh
+cp .env.example .env
+```
+
+Then edit `.env` with your actual API keys and model choices:
+
+```dotenv
+# Default mode: auto-detect provider from model ID
+VCF_ARCHITECT_MODEL=gpt-4o-mini
+VCF_REFEREE_MODEL=gpt-4o-mini
+VCF_REQUEST_TIMEOUT=60
+```
+
+**⚠️ Never commit a real `.env` file.** Only `.env.example` (with placeholders) is tracked in version control.
+
+---
+
+## Configuration
+
+### Model Selection
+
+Model IDs follow the **LiteLLM naming convention**. Any provider supported by LiteLLM can be used without code changes:
+
+- `gpt-4o-mini` (OpenAI)
+- `claude-3-5-sonnet` (Anthropic)
+- `anthropic/claude-3-5-sonnet` (via Anthropic's API)
+- `openrouter/google/gemini-2.0-flash-001` (via OpenRouter)
+- `ollama/llama3` (local Ollama)
+
+### Provider Modes
+
+#### Default Mode (Recommended)
+
+By default (`VCF_API_PROVIDER=default` or unset), LiteLLM auto-detects the provider from the model ID and uses that provider's standard environment variables:
+
+```dotenv
+VCF_API_PROVIDER=default        # (or omit this entirely)
+VCF_ARCHITECT_MODEL=gpt-4o-mini
+VCF_REFEREE_MODEL=gpt-4o-mini
+OPENAI_API_KEY=sk-your-key      # auto-detected from model ID
+VCF_REQUEST_TIMEOUT=60
+```
+
+#### AgentRouter Mode
+
+[AgentRouter](https://agentrouter.org) is an OpenAI-compatible gateway. To route VCF through it:
+
+```dotenv
+VCF_API_PROVIDER=agentrouter
+AGENTROUTER_API_KEY=sk-agentrouter-xxxxx
+VCF_API_BASE=https://agentrouter.org/v1
+VCF_ARCHITECT_MODEL=gpt-4o-mini
+VCF_REFEREE_MODEL=gpt-4o-mini
+VCF_REQUEST_TIMEOUT=60
+```
+
+With `VCF_API_PROVIDER=agentrouter`:
+- VCF calls LiteLLM with `api_key=AGENTROUTER_API_KEY` and `api_base=VCF_API_BASE`
+- Your `OPENAI_API_KEY` (if set) is **not** used for VCF calls
+- `AGENTROUTER_API_KEY` is **never** logged, printed, or written to diagnostics
+
+### Environment Variables Reference
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `VCF_ARCHITECT_MODEL` | `gpt-4o-mini` | Model ID for the Architect (draft generation) |
+| `VCF_REFEREE_MODEL` | `gpt-4o-mini` | Model ID for the Referee (validation) |
+| `VCF_REQUEST_TIMEOUT` | `60` | Per-call timeout in seconds |
+| `VCF_CONTEXT_MAX_CHARS` | `6000` | Max characters from project context file |
+| `VCF_ZED_DIR` | `.zed` | Output directory for prompts and diagnostics |
+| `VCF_API_PROVIDER` | `default` | Provider mode: `default` or `agentrouter` |
+| `VCF_API_BASE` | (none) | Required for `agentrouter` mode (e.g., `https://agentrouter.org/v1`) |
+| `AGENTROUTER_API_KEY` | (none) | API key for AgentRouter mode |
+
+### Project Context (SSOT)
+
+VCF automatically loads project context from the first file found, in order:
+
+1. `PROJECT_CONTEXT.md` (current directory)
+2. `docs/MEMORY.md`
+
+The context is truncated to `VCF_CONTEXT_MAX_CHARS` (default: 6000 characters) and injected into the Architect's prompt to provide project-specific knowledge.
+
+---
+
+## CLI Usage
+
+### Basic Invocation
+
+```sh
+python vcf.py "Add retry logic to the connection handler"
+```
+
+This will:
+1. Load project context (if available)
+2. Run the Architect to draft a structured prompt
+3. Run the Referee to validate the draft
+4. If rejected, give the Architect one chance to fix it
+5. Write the approved prompt to `.zed/prompt.md` or diagnostics to `.zed/review.md`
+
+### Command-Line Options
+
+```
+usage: vcf.py [-h] [--architect-model ARCHITECT_MODEL] 
+              [--referee-model REFEREE_MODEL] [--timeout TIMEOUT] 
+              task
+
+positional arguments:
+  task                  The user's task description
+
+optional arguments:
+  -h, --help            Show this help message and exit
+  --architect-model ARCHITECT_MODEL
+                        Override VCF_ARCHITECT_MODEL
+  --referee-model REFEREE_MODEL
+                        Override VCF_REFEREE_MODEL
+  --timeout TIMEOUT     Override VCF_REQUEST_TIMEOUT (seconds)
+```
+
+### Example Commands
+
+```sh
+# Default: use .env configuration
+python vcf.py "Refactor authentication logic"
+
+# Override models for a specific run
+python vcf.py "Add unit tests" \
+  --architect-model anthropic/claude-3-5-sonnet \
+  --referee-model gpt-4o
+
+# Increase timeout for slower providers
+python vcf.py "Complex data migration" --timeout 120
+```
+
+### Output Files
+
+On **success** (status = `APPROVED`):
+- **`.zed/prompt.md`**: The final, validated prompt ready to paste into an AI IDE agent
+
+On **failure** (status = `REJECT` or `ERROR`):
+- **`.zed/review.md`**: Diagnostic information including:
+  - Task description
+  - All Architect drafts (JSON)
+  - All Referee reviews and critiques
+  - Error messages (if any)
+  - Feedback and required changes
+
+The existing `.zed/prompt.md` is **never** overwritten on failure, preserving the last approved prompt.
+
+---
+
+## Exit Codes
+
+| Code | Status | Meaning |
+|------|--------|---------|
+| `0` | `APPROVED` | Prompt was successfully validated and written to `.zed/prompt.md` |
+| `1` | `REJECT` | Prompt was rejected by the Referee after one fix attempt |
+| `1` | `ERROR` | LLM call failed, invalid JSON, timeout, or filesystem error |
+
+---
+
+## Testing
+
+Run the full test suite:
+
+```sh
+pytest tests/ -v
+```
+
+Run a specific test:
+
+```sh
+pytest tests/test_vcf.py::TestApprovedFlow::test_approved_on_first_pass -v
+```
+
+### Test Coverage
+
+- **29 comprehensive unit tests** covering:
+  - Approved flow (first pass and after one fix cycle)
+  - Reject flow (after fix attempt, prompt preservation)
+  - JSON repair (malformed responses, recovery)
+  - Contract validation (structural checks)
+  - Filesystem isolation (`.zed/` directory creation)
+  - Provider configuration (default and AgentRouter modes)
+  - Error handling (LLM failures, timeouts)
+
+All tests are **fully isolated**: no real LLM calls, no real network I/O. LiteLLM is monkeypatched with `AsyncMock`, and filesystem operations use pytest's `tmp_path` fixture.
+
+---
+
+## Architecture Notes
+
+### Stateless Design
+
+- Every function accepts explicit parameters (models, timeouts, directories) instead of relying on global state
+- No persistent cache or session management
+- Safe to run in parallel; no race conditions
+- Easily unit-testable with mocked LLM responses
+
+### Contract Validation
+
+- **Structural validation** (deterministic, no LLM call):  
+  Checks that all four required Markdown headings are present, in order, each with non-empty content
+  
+- **Semantic validation** (performed by the Referee LLM):  
+  Detects meta-prompts, contradictions, invented project facts, vagueness, and safety concerns
+
+The two-stage validation prevents invalid prompts from reaching the IDE agent and allows the pipeline to reject structurally invalid drafts without spending an LLM call.
+
+### Fix Cycle
+
+- Only **one fix cycle** is allowed (Architect gets one chance to correct feedback)
+- If the Referee rejects the second draft, the pipeline fails with status `REJECT`
+- This prevents infinite loops and keeps costs predictable
+
+---
+
+## Dependencies
+
+- **Python 3.9+**
+- **pydantic** (data validation)
+- **litellm** (LLM provider abstraction)
+- **python-dotenv** (environment variable loading)
+- **pytest** (testing framework; dev dependency)
+
+See `requirements.txt` for pinned versions.
+
+---
+
+## License & Contributing
+
+This project is part of the Prompt Refinery ecosystem. Contributions are welcome; please ensure all tests pass before submitting a pull request.
+
+---
+
+## Troubleshooting
+
+### "Unsupported VCF_API_PROVIDER"
+
+Make sure `VCF_API_PROVIDER` is set to `default` or `agentrouter` (case-insensitive).
+
+### "Prompt was rejected by the Referee"
+
+Check `.zed/review.md` for the Referee's critique and required changes. The Architect will attempt one fix; if it still fails, you may need to refine the task description or project context.
+
+### "LLM call failed"
+
+- Verify your API key is set correctly and has valid credentials
+- Check `VCF_REQUEST_TIMEOUT` is reasonable for your network
+- For AgentRouter, ensure both `AGENTROUTER_API_KEY` and `VCF_API_BASE` are set
+
+### "JSON validation failed after 1 repair attempt"
+
+The model returned malformed JSON even after repair instructions. Try:
+- Using a different model (smaller models may struggle)
+- Increasing `VCF_REQUEST_TIMEOUT`
+- Simplifying your task description
+
+---
+
+## Quick Reference
+
+```sh
+# Install
+pip install -r requirements.txt
+
+# Configure
+cp .env.example .env
+# Edit .env with your API keys and model choices
+
+# Run
+python vcf.py "Your task description here"
+
+# Check result
+cat .zed/prompt.md        # on success
+cat .zed/review.md        # on failure
+
+# Test
+pytest tests/ -v
+```

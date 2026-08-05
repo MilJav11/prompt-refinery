@@ -1,0 +1,578 @@
+"""Stateless Architect -> Referee -> Fix -> Re-check orchestration loop.
+
+This module contains no CLI concerns. Every function accepts explicit
+parameters (models, timeouts, directories) so it can be exercised in unit
+tests without touching the real filesystem, network, or environment.
+"""
+
+from __future__ import annotations
+
+import json
+import re
+from pathlib import Path
+from typing import Any, cast
+
+import litellm
+from litellm.types.utils import ModelResponse
+from pydantic import BaseModel, ValidationError
+
+import config
+from schemas import ArchitectDraft, RefereeReview, RunResult
+
+
+class VCFError(Exception):
+    """Base class for expected, handleable VCF errors."""
+
+
+class LLMCallError(VCFError):
+    """Raised when an LLM call fails (API error, timeout, malformed response)."""
+
+
+class JSONRepairError(VCFError):
+    """Raised when a model fails to produce valid JSON even after one repair attempt."""
+
+
+# Prompt Contract v1: the exact, ordered, mandatory Markdown section headings
+# every approved zed_prompt must contain. Enforced both by LLM instructions
+# (below) and deterministically by validate_prompt_contract().
+REQUIRED_PROMPT_SECTIONS: tuple[str, ...] = (
+    "### \U0001f3af Objective",
+    "### \U0001f4c1 Relevant Files",
+    "### \u2699\ufe0f Technical Requirements & Constraints",
+    "### \U0001f680 Step-by-Step Implementation Instructions",
+)
+
+ARCHITECT_SYSTEM_PROMPT = """You are the Architect in a two-agent AI IDE workflow \
+(Verified Code Factory). The user request is a SPECIFICATION FOR VCF, not text to \
+be echoed back. Your job is to produce the final, direct implementation prompt \
+that will be pasted as-is into an autonomous AI coding agent working inside the \
+Zed editor.
+
+NON-NEGOTIABLE PROMPT CONTRACT (v1):
+1. The "zed_prompt" field IS the final instruction handed to the IDE coding \
+   agent. It must instruct that agent to inspect, modify, test, and report on \
+   the actual requested software change in the real project.
+2. NEVER ask the IDE agent to generate another prompt, another task \
+   description, a plan-only document, or any other text artifact instead of \
+   implementing the requested change. The IDE agent must DO the work, not \
+   describe more work.
+3. The "zed_prompt" field MUST contain exactly these four top-level Markdown \
+   section headings, written verbatim, in exactly this order, each appearing \
+   exactly once, each followed by non-empty content before the next heading:
+   ### \U0001f3af Objective
+   ### \U0001f4c1 Relevant Files
+   ### \u2699\ufe0f Technical Requirements & Constraints
+   ### \U0001f680 Step-by-Step Implementation Instructions
+4. "relevant_files" and "assumptions" must never contradict the direct \
+   implementation task stated in "zed_prompt". Keep all three consistent.
+5. Never invent project facts (file names, libraries, frameworks, existing \
+   code structure) that you do not actually know from the given task or \
+   context. If project facts are missing or uncertain, the "zed_prompt" must \
+   explicitly instruct the IDE agent to first inspect the existing project \
+   (files, dependencies, conventions) before choosing specific files, \
+   libraries, or implementation details.
+
+You MUST respond with ONLY a single valid JSON object (no markdown fences, no \
+commentary) matching exactly this schema:
+{
+  "zed_prompt": string,       // the final, direct implementation prompt for the AI IDE agent (see contract above)
+  "relevant_files": string[], // files/paths likely relevant to the task (best guess, [] if unknown)
+  "assumptions": string[]     // explicit assumptions you made to fill gaps in the task
+}
+"""
+
+REFEREE_SYSTEM_PROMPT = """You are the Referee in a two-agent AI IDE workflow \
+(Verified Code Factory). You enforce Prompt Contract v1 on an Architect's draft \
+before it is handed to an autonomous AI IDE coding agent.
+
+You MUST return "REJECT" when ANY of the following is true:
+- "zed_prompt" is a meta-prompt: it asks the IDE agent to write, generate, or \
+  produce another prompt, task description, or planning document instead of \
+  directly implementing the requested software change.
+- One or more of these four mandatory Markdown section headings is missing, \
+  duplicated, or out of order (they must appear verbatim, in this exact order, \
+  exactly once each):
+  ### \U0001f3af Objective
+  ### \U0001f4c1 Relevant Files
+  ### \u2699\ufe0f Technical Requirements & Constraints
+  ### \U0001f680 Step-by-Step Implementation Instructions
+- "assumptions", "relevant_files", and "zed_prompt" contradict each other.
+- "zed_prompt" invents specific project facts (file names, libraries, existing \
+  structure) instead of instructing the IDE agent to inspect the real project \
+  first when such facts are not actually known.
+- "zed_prompt" does not provide a direct implementation task, clear scope \
+  limits, and concrete verification/test expectations for the IDE agent.
+
+Also reject drafts that are vague, unsafe, or otherwise missing critical \
+information.
+
+You MUST respond with ONLY a single valid JSON object (no markdown fences, no \
+commentary) matching exactly this schema:
+{
+  "status": "APPROVED" | "REJECT",
+  "critique": string[],           // issues found, [] if none
+  "required_changes": string[]    // concrete changes the Architect must make if REJECT, [] if APPROVED
+}
+"""
+
+_JSON_FENCE_RE = re.compile(r"^```(?:json)?\s*(.*?)\s*```$", re.DOTALL)
+
+
+def _strip_code_fence(text: str) -> str:
+    text = text.strip()
+    match = _JSON_FENCE_RE.match(text)
+    if match:
+        return match.group(1).strip()
+    return text
+
+
+def _extract_json_object(text: str) -> str:
+    """Best-effort extraction of a JSON object from a raw LLM response."""
+    stripped = _strip_code_fence(text)
+    start = stripped.find("{")
+    end = stripped.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        return stripped[start : end + 1]
+    return stripped
+
+
+class ContractValidationResult:
+    """Result of deterministic Prompt Contract v1 structural validation.
+
+    ``is_valid`` is ``True`` only if every mandatory section heading is
+    present exactly once, in the required order, each with non-empty content.
+    """
+
+    __slots__ = ("errors", "is_valid")
+
+    def __init__(self, is_valid: bool, errors: tuple[str, ...] = ()) -> None:
+        self.is_valid = is_valid
+        self.errors = errors
+
+    def __repr__(self) -> str:  # pragma: no cover - debugging aid only
+        return f"ContractValidationResult(is_valid={self.is_valid!r}, errors={self.errors!r})"
+
+
+def validate_prompt_contract(zed_prompt: str) -> ContractValidationResult:
+    """Deterministically validate the mandatory Prompt Contract v1 structure.
+
+    Performs no LLM call and no subjective/semantic judgement. It only checks,
+    on the raw Markdown text of ``zed_prompt``:
+
+      1. All four mandatory section headings (``REQUIRED_PROMPT_SECTIONS``)
+         are present, matched verbatim on their own line.
+      2. Each heading appears exactly once.
+      3. The headings appear in the required order.
+      4. Each section has non-empty (non-whitespace) content before the next
+         heading, or before the end of the prompt for the last section.
+
+    Semantic checks (meta-prompt detection, contradictions between fields,
+    invented project facts) are intentionally out of scope here and remain
+    the Referee's responsibility.
+    """
+    errors: list[str] = []
+    lines = zed_prompt.splitlines()
+
+    # Locate every occurrence of each required heading, matched verbatim on
+    # its own line (surrounding whitespace ignored).
+    positions: dict[str, list[int]] = {heading: [] for heading in REQUIRED_PROMPT_SECTIONS}
+    for idx, line in enumerate(lines):
+        stripped = line.strip()
+        if stripped in positions:
+            positions[stripped].append(idx)
+
+    for heading in REQUIRED_PROMPT_SECTIONS:
+        count = len(positions[heading])
+        if count == 0:
+            errors.append(f"Missing required section heading: '{heading}'.")
+        elif count > 1:
+            errors.append(
+                f"Section heading '{heading}' appears {count} times; "
+                "it must appear exactly once."
+            )
+
+    if errors:
+        return ContractValidationResult(is_valid=False, errors=tuple(errors))
+
+    # All headings present exactly once: verify they appear in order.
+    ordered_positions = [positions[heading][0] for heading in REQUIRED_PROMPT_SECTIONS]
+    if ordered_positions != sorted(ordered_positions):
+        errors.append(
+            "Mandatory sections are out of order. Required order: "
+            + " -> ".join(REQUIRED_PROMPT_SECTIONS)
+        )
+        return ContractValidationResult(is_valid=False, errors=tuple(errors))
+
+    # Verify each section has non-empty content before the next heading (or EOF).
+    boundaries = ordered_positions + [len(lines)]
+    for i, heading in enumerate(REQUIRED_PROMPT_SECTIONS):
+        start = boundaries[i] + 1
+        end = boundaries[i + 1]
+        section_lines = lines[start:end]
+        if not any(line.strip() for line in section_lines):
+            errors.append(f"Section '{heading}' has no content.")
+
+    return ContractValidationResult(is_valid=not errors, errors=tuple(errors))
+
+
+def load_ssot_context(
+    base_dir: str | Path = ".",
+    max_chars: int = config.CONTEXT_MAX_CHARS,
+) -> str:
+    """Load up to ``max_chars`` characters from the first SSOT context file found.
+
+    Checks ``PROJECT_CONTEXT.md`` then ``docs/MEMORY.md`` (relative to
+    ``base_dir``). Returns an empty string if neither file exists or is
+    readable.
+    """
+    base = Path(base_dir)
+    for relative in config.CONTEXT_FILENAMES:
+        candidate = base / relative
+        if candidate.is_file():
+            try:
+                text = candidate.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            return text[:max_chars]
+    return ""
+
+
+def _provider_call_kwargs() -> dict[str, Any]:
+    """Build the extra LiteLLM kwargs for the configured provider.
+
+    In "default" mode this returns an empty dict, so LiteLLM's normal
+    provider auto-detection and credential resolution is left completely
+    unchanged. In "agentrouter" mode, ``api_key``/``api_base`` route the call
+    to AgentRouter's OpenAI-compatible endpoint instead of the user's
+    ``OPENAI_API_KEY``. The api_key is passed only as a direct call kwarg and
+    is never logged, printed, or included in diagnostics.
+    """
+    provider = config.get_provider_config()
+    kwargs: dict[str, Any] = {}
+    if provider.api_key is not None:
+        kwargs["api_key"] = provider.api_key
+    if provider.api_base is not None:
+        kwargs["api_base"] = provider.api_base
+    if provider.custom_llm_provider is not None:
+        kwargs["custom_llm_provider"] = provider.custom_llm_provider
+    return kwargs
+
+
+async def _call_llm(model: str, messages: list[dict[str, Any]], timeout: float) -> str:
+    try:
+        provider_kwargs = _provider_call_kwargs()
+    except ValueError as exc:
+        raise LLMCallError(f"Invalid provider configuration: {exc}") from exc
+
+    try:
+        raw_response = await litellm.acompletion(
+            model=model,
+            messages=messages,
+            timeout=timeout,
+            stream=False,
+            **provider_kwargs,
+        )
+    except Exception as exc:  # litellm raises many provider-specific subclasses
+        raise LLMCallError(f"LLM call to '{model}' failed: {exc}") from exc
+
+    response = cast(ModelResponse, raw_response)
+    try:
+        return response["choices"][0]["message"]["content"]
+    except (KeyError, IndexError, TypeError) as exc:
+        raise LLMCallError(
+            f"Unexpected LLM response shape from '{model}': {exc}"
+        ) from exc
+
+
+async def _get_structured_response(
+    model: str,
+    messages: list[dict[str, Any]],
+    schema: type[BaseModel],
+    timeout: float,
+) -> BaseModel:
+    """Call the model and parse its reply into ``schema``.
+
+    If the first reply is not valid JSON matching the schema, makes exactly
+    one repair call asking the same model to return only valid JSON.
+    """
+    raw = await _call_llm(model, messages, timeout)
+    try:
+        return schema.model_validate_json(_extract_json_object(raw))
+    except (ValidationError, ValueError):
+        pass
+
+    repair_messages = messages + [
+        {"role": "assistant", "content": raw},
+        {
+            "role": "user",
+            "content": (
+                "Your previous response was not valid JSON matching the required "
+                "schema. Return ONLY valid JSON matching the schema, with no "
+                "markdown formatting, no code fences, and no additional commentary."
+            ),
+        },
+    ]
+    repaired_raw = await _call_llm(model, repair_messages, timeout)
+    try:
+        return schema.model_validate_json(_extract_json_object(repaired_raw))
+    except (ValidationError, ValueError) as exc:
+        raise JSONRepairError(
+            f"Model '{model}' failed to produce valid JSON matching "
+            f"{schema.__name__} after 1 repair attempt: {exc}"
+        ) from exc
+
+
+def _build_architect_user_message(
+    task: str,
+    context: str,
+    feedback: RefereeReview | None,
+) -> str:
+    parts = [f"User task:\n{task}"]
+    if context:
+        parts.append(
+            f"Project context (SSOT, truncated to {config.CONTEXT_MAX_CHARS} chars):\n{context}"
+        )
+    else:
+        parts.append("No project context is available.")
+    if feedback is not None:
+        parts.append(
+            "Your previous draft was REJECTED by the Referee.\n"
+            f"Critique: {feedback.critique}\n"
+            f"Required changes: {feedback.required_changes}\n"
+            "Produce a corrected draft that addresses all required changes."
+        )
+    return "\n\n".join(parts)
+
+
+async def run_architect(
+    task: str,
+    context: str,
+    model: str,
+    timeout: float,
+    feedback: RefereeReview | None = None,
+) -> ArchitectDraft:
+    messages = [
+        {"role": "system", "content": ARCHITECT_SYSTEM_PROMPT},
+        {"role": "user", "content": _build_architect_user_message(task, context, feedback)},
+    ]
+    draft = await _get_structured_response(model, messages, ArchitectDraft, timeout)
+    assert isinstance(draft, ArchitectDraft)
+    return draft
+
+
+async def run_referee(
+    draft: ArchitectDraft,
+    model: str,
+    timeout: float,
+) -> RefereeReview:
+    messages = [
+        {"role": "system", "content": REFEREE_SYSTEM_PROMPT},
+        {
+            "role": "user",
+            "content": (
+                "Review the following Architect draft (JSON):\n"
+                f"{draft.model_dump_json(indent=2)}"
+            ),
+        },
+    ]
+    review = await _get_structured_response(model, messages, RefereeReview, timeout)
+    assert isinstance(review, RefereeReview)
+    return review
+
+
+def _contract_violation_review(result: ContractValidationResult) -> RefereeReview:
+    """Synthesize a REJECT RefereeReview from a failed structural contract check.
+
+    No LLM call is made: a draft that deterministically fails Prompt Contract
+    v1 is rejected immediately so it flows through the existing single
+    fix-cycle exactly like a normal Referee rejection, without consuming an
+    extra retry.
+    """
+    return RefereeReview(
+        status="REJECT",
+        critique=[f"Prompt Contract v1 violation: {msg}" for msg in result.errors],
+        required_changes=[
+            "Rewrite zed_prompt so it contains exactly these four Markdown "
+            "sections, in this order, each with non-empty content: "
+            + " -> ".join(REQUIRED_PROMPT_SECTIONS)
+        ],
+    )
+
+
+async def _review_with_contract_gate(
+    draft: ArchitectDraft,
+    referee_model: str,
+    timeout: float,
+) -> RefereeReview:
+    """Enforce Prompt Contract v1 structure before invoking the Referee LLM.
+
+    Runs the deterministic, local ``validate_prompt_contract`` check first. If
+    the draft fails it, returns a synthetic REJECT review immediately (no LLM
+    call) so the caller's existing fix-cycle handles it exactly like any other
+    rejection. Only structurally valid drafts are sent to the real Referee,
+    which remains responsible for semantic judgement (meta-prompt detection,
+    contradictions, invented facts).
+    """
+    contract_result = validate_prompt_contract(draft.zed_prompt)
+    if not contract_result.is_valid:
+        return _contract_violation_review(contract_result)
+    return await run_referee(draft, referee_model, timeout)
+
+
+def write_zed_prompt(content: str, zed_dir: str | Path = config.ZED_DIR) -> Path:
+    zed_path = Path(zed_dir)
+    zed_path.mkdir(parents=True, exist_ok=True)
+    prompt_path = zed_path / "prompt.md"
+    prompt_path.write_text(content, encoding="utf-8")
+    return prompt_path
+
+
+def _format_review_markdown(info: dict[str, Any]) -> str:
+    lines = ["# VCF Review", "", f"**Status:** {info.get('status', 'UNKNOWN')}", ""]
+
+    if info.get("error"):
+        lines += [f"**Error:** {info['error']}", ""]
+
+    task = info.get("task")
+    if task:
+        lines += ["## Task", "", task, ""]
+
+    for idx, review in enumerate(info.get("reviews", []), start=1):
+        lines.append(f"## Referee Review #{idx}")
+        lines.append(f"- Status: {review.get('status')}")
+        if review.get("critique"):
+            lines.append("- Critique:")
+            lines += [f"  - {item}" for item in review["critique"]]
+        if review.get("required_changes"):
+            lines.append("- Required changes:")
+            lines += [f"  - {item}" for item in review["required_changes"]]
+        lines.append("")
+
+    for idx, draft in enumerate(info.get("drafts", []), start=1):
+        lines.append(f"## Architect Draft #{idx}")
+        lines.append("```json")
+        lines.append(json.dumps(draft, indent=2, ensure_ascii=False))
+        lines.append("```")
+        lines.append("")
+
+    return "\n".join(lines)
+
+
+def write_review(diagnostic_info: dict[str, Any], zed_dir: str | Path = config.ZED_DIR) -> Path:
+    zed_path = Path(zed_dir)
+    zed_path.mkdir(parents=True, exist_ok=True)
+    review_path = zed_path / "review.md"
+    review_path.write_text(_format_review_markdown(diagnostic_info), encoding="utf-8")
+    return review_path
+
+
+def _finalize_approved(
+    draft: ArchitectDraft,
+    diagnostic_info: dict[str, Any],
+    zed_dir: str | Path,
+) -> RunResult | None:
+    """Write the Referee-approved draft, gated by one final contract check.
+
+    This is a defense-in-depth re-check performed immediately before writing
+    ``.zed/prompt.md`` (in addition to the earlier gate applied right after
+    each Architect draft is parsed). It should be structurally unreachable in
+    the normal flow, since a draft can only reach APPROVED status after
+    already passing ``validate_prompt_contract`` in
+    ``_review_with_contract_gate``.
+
+    Returns ``None`` if the write succeeded (caller should return its own
+    APPROVED ``RunResult``), or a completed ERROR ``RunResult`` if the
+    contract check unexpectedly fails here -- in which case the existing
+    ``prompt.md`` is left untouched and diagnostics are written instead.
+    """
+    final_check = validate_prompt_contract(draft.zed_prompt)
+    if not final_check.is_valid:
+        diagnostic_info["status"] = "ERROR"
+        diagnostic_info["error"] = (
+            "Prompt Contract v1 validation failed immediately before writing "
+            "the approved prompt: " + "; ".join(final_check.errors)
+        )
+        write_review(diagnostic_info, zed_dir)
+        return RunResult(final_prompt=None, status="ERROR", diagnostic_info=diagnostic_info)
+
+    write_zed_prompt(draft.zed_prompt, zed_dir)
+    return None
+
+
+async def run_pipeline(
+    task: str,
+    architect_model: str | None = None,
+    referee_model: str | None = None,
+    timeout: float | None = None,
+    context_dir: str | Path = ".",
+    zed_dir: str | Path = config.ZED_DIR,
+) -> RunResult:
+    """Run the full Architect -> Referee -> Fix -> Re-check loop.
+
+    On success (final status APPROVED), writes ``zed_prompt`` to
+    ``<zed_dir>/prompt.md``. On any failure path (REJECT after the single fix
+    attempt, invalid JSON after repair, or an API/timeout error), the
+    existing ``prompt.md`` is left untouched and diagnostics are written to
+    ``<zed_dir>/review.md`` instead.
+    """
+    architect_model = architect_model or config.ARCHITECT_MODEL
+    referee_model = referee_model or config.REFEREE_MODEL
+    timeout = timeout if timeout is not None else config.REQUEST_TIMEOUT
+
+    diagnostic_info: dict[str, Any] = {"task": task, "drafts": [], "reviews": []}
+
+    try:
+        context = load_ssot_context(context_dir)
+
+        draft = await run_architect(task, context, architect_model, timeout)
+        diagnostic_info["drafts"].append(draft.model_dump())
+
+        # Prompt Contract v1 structural gate: a draft that deterministically
+        # fails it is rejected without spending a Referee LLM call.
+        review = await _review_with_contract_gate(draft, referee_model, timeout)
+        diagnostic_info["reviews"].append(review.model_dump())
+
+        if review.status == "APPROVED":
+            failure = _finalize_approved(draft, diagnostic_info, zed_dir)
+            if failure is not None:
+                return failure
+            diagnostic_info["status"] = "APPROVED"
+            return RunResult(
+                final_prompt=draft.zed_prompt,
+                status="APPROVED",
+                diagnostic_info=diagnostic_info,
+            )
+
+        # Single fix cycle: give the Architect the Referee's feedback, then
+        # re-verify with a mandatory second Referee pass (also contract-gated).
+        fixed_draft = await run_architect(
+            task, context, architect_model, timeout, feedback=review
+        )
+        diagnostic_info["drafts"].append(fixed_draft.model_dump())
+
+        second_review = await _review_with_contract_gate(fixed_draft, referee_model, timeout)
+        diagnostic_info["reviews"].append(second_review.model_dump())
+
+        if second_review.status == "APPROVED":
+            failure = _finalize_approved(fixed_draft, diagnostic_info, zed_dir)
+            if failure is not None:
+                return failure
+            diagnostic_info["status"] = "APPROVED"
+            return RunResult(
+                final_prompt=fixed_draft.zed_prompt,
+                status="APPROVED",
+                diagnostic_info=diagnostic_info,
+            )
+
+        diagnostic_info["status"] = "REJECT"
+        write_review(diagnostic_info, zed_dir)
+        return RunResult(final_prompt=None, status="REJECT", diagnostic_info=diagnostic_info)
+
+    except (LLMCallError, JSONRepairError, OSError) as exc:
+        diagnostic_info["status"] = "ERROR"
+        diagnostic_info["error"] = str(exc)
+        try:
+            write_review(diagnostic_info, zed_dir)
+        except OSError:
+            pass
+        return RunResult(final_prompt=None, status="ERROR", diagnostic_info=diagnostic_info)
