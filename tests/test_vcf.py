@@ -59,12 +59,18 @@ def draft_json(prompt: str | None = None, files=None, assumptions=None) -> str:
     )
 
 
-def review_json(status: str = "APPROVED", critique=None, required_changes=None) -> str:
+def review_json(
+    status: str = "APPROVED",
+    critique=None,
+    required_changes=None,
+    suggested_prompt: str | None = None,
+) -> str:
     return json.dumps(
         {
             "status": status,
             "critique": critique or [],
             "required_changes": required_changes or [],
+            "suggested_prompt": suggested_prompt,
         }
     )
 
@@ -697,3 +703,155 @@ class TestPromptContractEnforcement:
         # compliant fix draft. The first (non-compliant) draft never reaches
         # the Referee.
         assert mock.await_count == 3
+
+
+class TestSuggestedFallbackPrompt:
+    """Verify the ### 💡 Suggested Fallback Prompt section in .zed/review.md.
+
+    The section must be present on every REJECT/ERROR path and must follow
+    the three-level resolution hierarchy:
+      1. RefereeReview.suggested_prompt (last review, if non-empty)
+      2. ArchitectDraft.zed_prompt      (last draft, if any)
+      3. "No fallback available" message (if the pipeline failed before
+         the first Architect draft was produced)
+    """
+
+    FALLBACK_HEADING = "### 💡 Suggested Fallback Prompt"
+
+    def test_referee_suggested_prompt_used_when_present(self, tmp_path, monkeypatch):
+        """When the terminal Referee review carries suggested_prompt, it is
+        rendered verbatim in the fallback section of review.md."""
+        referee_suggestion = compliant_prompt("referee's best-effort correction")
+        mock = AsyncMock(
+            side_effect=[
+                llm_response(draft_json(prompt=compliant_prompt("v1 too vague"))),
+                llm_response(
+                    review_json(
+                        status="REJECT",
+                        critique=["too vague"],
+                        required_changes=["be specific"],
+                    )
+                ),
+                llm_response(draft_json(prompt=compliant_prompt("v2 still off"))),
+                # Terminal review carries the suggestion.
+                llm_response(
+                    review_json(
+                        status="REJECT",
+                        critique=["still missing test assertions"],
+                        required_changes=["add assertions"],
+                        suggested_prompt=referee_suggestion,
+                    )
+                ),
+            ]
+        )
+        monkeypatch.setattr(orchestrator.litellm, "acompletion", mock)
+
+        zed_dir = tmp_path / ".zed"
+        result = run_pipeline(
+            "task",
+            architect_model="fake/architect",
+            referee_model="fake/referee",
+            context_dir=tmp_path,
+            zed_dir=zed_dir,
+        )
+
+        assert result.status == "REJECT"
+        content = (zed_dir / "review.md").read_text(encoding="utf-8")
+        assert self.FALLBACK_HEADING in content
+        # The Referee's suggestion must appear verbatim after the heading.
+        fallback_section = content.split(self.FALLBACK_HEADING)[-1]
+        assert "referee's best-effort correction" in fallback_section
+        # The section must be wrapped in a Markdown code block.
+        assert "```" in fallback_section
+
+    def test_fallback_uses_last_architect_draft_when_no_suggestion(self, tmp_path, monkeypatch):
+        """When no Referee review carries suggested_prompt, the fallback
+        section shows the last Architect draft's zed_prompt instead."""
+        v2_prompt = compliant_prompt("v2 fixed but still rejected")
+        mock = AsyncMock(
+            side_effect=[
+                llm_response(draft_json(prompt=compliant_prompt("v1 too vague"))),
+                llm_response(
+                    review_json(status="REJECT", critique=["too vague"])
+                    # no suggested_prompt
+                ),
+                llm_response(draft_json(prompt=v2_prompt)),
+                llm_response(
+                    review_json(status="REJECT", critique=["still off"])
+                    # no suggested_prompt
+                ),
+            ]
+        )
+        monkeypatch.setattr(orchestrator.litellm, "acompletion", mock)
+
+        zed_dir = tmp_path / ".zed"
+        result = run_pipeline(
+            "task",
+            architect_model="fake/architect",
+            referee_model="fake/referee",
+            context_dir=tmp_path,
+            zed_dir=zed_dir,
+        )
+
+        assert result.status == "REJECT"
+        content = (zed_dir / "review.md").read_text(encoding="utf-8")
+        assert self.FALLBACK_HEADING in content
+        fallback_section = content.split(self.FALLBACK_HEADING)[-1]
+        # The last Architect draft (v2) must be the fallback, not v1.
+        assert "v2 fixed but still rejected" in fallback_section
+        assert "```" in fallback_section
+
+    def test_no_fallback_message_when_error_before_first_draft(self, tmp_path, monkeypatch):
+        """When the pipeline fails before producing any Architect draft
+        (e.g. an immediate API error), the fallback section renders the
+        'No fallback available' sentinel message instead of a code block."""
+        mock = AsyncMock(side_effect=RuntimeError("connection reset"))
+        monkeypatch.setattr(orchestrator.litellm, "acompletion", mock)
+
+        zed_dir = tmp_path / ".zed"
+        result = run_pipeline(
+            "task",
+            architect_model="fake/architect",
+            referee_model="fake/referee",
+            context_dir=tmp_path,
+            zed_dir=zed_dir,
+        )
+
+        assert result.status == "ERROR"
+        content = (zed_dir / "review.md").read_text(encoding="utf-8")
+        assert self.FALLBACK_HEADING in content
+        fallback_section = content.split(self.FALLBACK_HEADING)[-1]
+        assert "No fallback available" in fallback_section
+        # No code block when there is nothing to show.
+        assert "```" not in fallback_section
+
+    def test_fallback_section_present_on_every_reject_path(self, tmp_path, monkeypatch):
+        """The fallback section heading must be present regardless of whether
+        the REJECT was triggered by the Referee LLM or the contract gate."""
+        # Both drafts violate Prompt Contract v1; the Referee is never called.
+        non_compliant = "Write a plan for what needs to be done."
+        mock = AsyncMock(
+            side_effect=[
+                llm_response(draft_json(prompt=non_compliant)),
+                llm_response(draft_json(prompt=non_compliant)),
+            ]
+        )
+        monkeypatch.setattr(orchestrator.litellm, "acompletion", mock)
+
+        zed_dir = tmp_path / ".zed"
+        result = run_pipeline(
+            "task",
+            architect_model="fake/architect",
+            referee_model="fake/referee",
+            context_dir=tmp_path,
+            zed_dir=zed_dir,
+        )
+
+        assert result.status == "REJECT"
+        content = (zed_dir / "review.md").read_text(encoding="utf-8")
+        # Heading always present.
+        assert self.FALLBACK_HEADING in content
+        # Fallback is the last (non-compliant) architect draft.
+        fallback_section = content.split(self.FALLBACK_HEADING)[-1]
+        assert non_compliant in fallback_section
+        assert "```" in fallback_section

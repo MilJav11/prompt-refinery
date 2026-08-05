@@ -254,8 +254,29 @@ On **failure** (status = `REJECT` or `ERROR`):
   - All Referee reviews and critiques
   - Error messages (if any)
   - Feedback and required changes
+  - **`### 💡 Suggested Fallback Prompt`** — a ready-to-use prompt at the end of the file (see below)
 
 The existing `.zed/prompt.md` is **never** overwritten on failure, preserving the last approved prompt.
+
+#### Suggested Fallback Prompt
+
+Every `review.md` produced on a `REJECT` or `ERROR` path ends with a
+`### 💡 Suggested Fallback Prompt` section containing a ready-to-copy starting
+point. The fallback is resolved using the following priority hierarchy:
+
+1. **Referee suggestion** — if the Referee returned a `suggested_prompt` field
+   in its final review, that complete corrected prompt is used verbatim.
+2. **Last Architect draft** — if no Referee suggestion was provided, the last
+   `ArchitectDraft.zed_prompt` produced during the run is used as a baseline
+   for manual editing.
+3. **No-fallback sentinel** — if the pipeline failed before the first Architect
+   draft was completed (e.g. an API authentication error or network timeout),
+   the section renders:
+   > *No fallback available — rerun with a more specific task description or verify API credentials.*
+
+The fallback prompt is wrapped in a fenced Markdown code block for instant
+copy-pasting. It is never the content of `.zed/prompt.md` — that file is only
+written on `APPROVED` status.
 
 ---
 
@@ -285,7 +306,7 @@ pytest tests/test_vcf.py::TestApprovedFlow::test_approved_on_first_pass -v
 
 ### Test Coverage
 
-- **29 comprehensive unit tests** covering:
+- **33 comprehensive unit tests** covering:
   - Approved flow (first pass and after one fix cycle)
   - Reject flow (after fix attempt, prompt preservation)
   - JSON repair (malformed responses, recovery)
@@ -293,6 +314,7 @@ pytest tests/test_vcf.py::TestApprovedFlow::test_approved_on_first_pass -v
   - Filesystem isolation (`.zed/` directory creation)
   - Provider configuration (default and AgentRouter modes)
   - Error handling (LLM failures, timeouts)
+  - Suggested Fallback Prompt resolution (Referee suggestion, last draft, no-fallback sentinel)
 
 All tests are **fully isolated**: no real LLM calls, no real network I/O. LiteLLM is monkeypatched with `AsyncMock`, and filesystem operations use pytest's `tmp_path` fixture.
 
@@ -309,13 +331,27 @@ All tests are **fully isolated**: no real LLM calls, no real network I/O. LiteLL
 
 ### Contract Validation
 
-- **Structural validation** (deterministic control flow, no LLM call):
+- **Structural validation** (deterministic control flow, no LLM call):  
   Checks that all four required Markdown headings are present, in order, each with non-empty content. This check is deterministic and produces consistent results.
   
 - **Semantic validation** (performed by the Referee LLM):  
   Detects meta-prompts, contradictions, invented project facts, vagueness, and safety concerns. Results may vary between runs due to LLM non-determinism.
 
 The two-stage validation prevents invalid prompts from reaching the IDE agent and allows the pipeline to reject structurally invalid drafts without spending an LLM call.
+
+### Suggested Fallback Prompt
+
+On every `REJECT` or `ERROR` path, `_format_review_markdown` appends a
+`### 💡 Suggested Fallback Prompt` section to `.zed/review.md`. The content is
+resolved from a three-level hierarchy (Referee `suggested_prompt` → last
+Architect draft → no-fallback sentinel) implemented in `_resolve_fallback_prompt`.
+
+- The Referee is instructed to populate `suggested_prompt` with a complete,
+  Prompt Contract v1-compliant corrected prompt whenever it issues a `REJECT`.
+- The field is optional (`str | None = None`) in `RefereeReview` so existing
+  clients that omit it continue to work unchanged.
+- Secrets and environment variable values are **never** included: the fallback
+  is derived solely from LLM-generated text already present in `diagnostic_info`.
 
 ### Fix Cycle
 

@@ -106,12 +106,20 @@ You MUST return "REJECT" when ANY of the following is true:
 Also reject drafts that are vague, unsafe, or otherwise missing critical \
 information.
 
+When your verdict is "REJECT", you SHOULD also provide a complete, best-effort \
+corrected version of the zed_prompt in "suggested_prompt". This corrected \
+prompt must satisfy Prompt Contract v1 (all four mandatory sections present, \
+in order, each with non-empty content; no meta-prompts; no invented project \
+facts). Set "suggested_prompt" to null when the verdict is "APPROVED" or when \
+you cannot produce a meaningful correction.
+
 You MUST respond with ONLY a single valid JSON object (no markdown fences, no \
 commentary) matching exactly this schema:
 {
   "status": "APPROVED" | "REJECT",
-  "critique": string[],           // issues found, [] if none
-  "required_changes": string[]    // concrete changes the Architect must make if REJECT, [] if APPROVED
+  "critique": string[],              // issues found, [] if none
+  "required_changes": string[],      // concrete changes the Architect must make if REJECT, [] if APPROVED
+  "suggested_prompt": string | null  // if REJECT: a complete corrected zed_prompt; null if APPROVED
 }
 """
 
@@ -419,6 +427,43 @@ async def _review_with_contract_gate(
     return await run_referee(draft, referee_model, timeout)
 
 
+_NO_FALLBACK_TEXT = (
+    "*No fallback available \u2014 rerun with a more specific task description "
+    "or verify API credentials.*"
+)
+
+
+def _resolve_fallback_prompt(info: dict[str, Any]) -> str | None:
+    """Resolve the best available fallback prompt from diagnostic_info.
+
+    Priority hierarchy:
+
+    1. ``suggested_prompt`` field of the last :class:`RefereeReview` in
+       ``info["reviews"]``, if provided and non-empty.
+    2. ``zed_prompt`` field of the last :class:`ArchitectDraft` in
+       ``info["drafts"]``, if any draft was produced.
+    3. ``None`` when the pipeline failed before producing any Architect draft
+       (e.g. an initial network/API error); the caller should render
+       :data:`_NO_FALLBACK_TEXT` instead.
+
+    This function never accesses credentials, environment variables, or any
+    value that could contain secrets.
+    """
+    reviews = info.get("reviews", [])
+    if reviews:
+        suggested = reviews[-1].get("suggested_prompt")
+        if suggested and suggested.strip():
+            return suggested
+
+    drafts = info.get("drafts", [])
+    if drafts:
+        last_zed_prompt = drafts[-1].get("zed_prompt", "")
+        if last_zed_prompt:
+            return last_zed_prompt
+
+    return None
+
+
 def write_zed_prompt(content: str, zed_dir: str | Path = config.ZED_DIR) -> Path:
     zed_path = Path(zed_dir)
     zed_path.mkdir(parents=True, exist_ok=True)
@@ -454,6 +499,16 @@ def _format_review_markdown(info: dict[str, Any]) -> str:
         lines.append(json.dumps(draft, indent=2, ensure_ascii=False))
         lines.append("```")
         lines.append("")
+
+    # --- Fallback Prompt -------------------------------------------------
+    # Always present so the developer has a ready-to-use starting point
+    # without having to dig through the draft JSON above.
+    lines += ["---", "", "### \U0001f4a1 Suggested Fallback Prompt", ""]
+    fallback = _resolve_fallback_prompt(info)
+    if fallback is not None:
+        lines += ["```", fallback, "```", ""]
+    else:
+        lines += [_NO_FALLBACK_TEXT, ""]
 
     return "\n".join(lines)
 
