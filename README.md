@@ -6,14 +6,14 @@ A **stateless artifact pipeline** that translates raw task descriptions into val
 
 ## Overview
 
-VCF runs a deterministic two-stage orchestration loop:
+VCF runs a stateless two-stage orchestration loop with deterministic control flow:
 
 1. **Architect Phase**: Converts a raw user task into a structured prompt draft (with relevant files and assumptions)
 2. **Referee Phase**: Validates the draft against Prompt Contract v1 and performs semantic review
 3. **Fix Cycle** (if rejected): Gives the Architect feedback for one correction attempt
 4. **Finalization**: Writes the approved prompt to `.zed/prompt.md`
 
-The entire pipeline is **stateless** and **deterministic**, making it safe to exercise in unit tests with mocked LLM responses and temporary filesystem directories.
+The entire pipeline is **stateless** with **deterministic control flow** and **deterministic structural validation**, making it safe to exercise in unit tests with mocked LLM responses and temporary filesystem directories. Note that LLM outputs and semantic review results can vary between runs.
 
 ---
 
@@ -33,7 +33,7 @@ The entire pipeline is **stateless** and **deterministic**, making it safe to ex
                      ▼
     ┌────────────────────────────────┐
     │ Prompt Contract v1 Structural  │
-    │ Validation (deterministic)     │
+    │ Validation (det. control flow) │
     └────────┬──────────┬────────────┘
              │          │
          Valid       Invalid
@@ -110,12 +110,14 @@ Copy the example environment file:
 cp .env.example .env
 ```
 
-Then edit `.env` with your actual API keys and model choices:
+Then edit `.env` with your actual API keys and model choices. See `.env.example` for configuration templates:
 
 ```dotenv
-# Default mode: auto-detect provider from model ID
-VCF_ARCHITECT_MODEL=gpt-4o-mini
-VCF_REFEREE_MODEL=gpt-4o-mini
+# Example: OpenRouter with Gemini 2.5 Flash Lite (recommended for smoke testing)
+OPENROUTER_API_KEY=your-openrouter-api-key
+VCF_API_PROVIDER=default
+VCF_ARCHITECT_MODEL=openrouter/google/gemini-2.5-flash-lite
+VCF_REFEREE_MODEL=openrouter/google/gemini-2.5-flash-lite
 VCF_REQUEST_TIMEOUT=60
 ```
 
@@ -132,7 +134,7 @@ Model IDs follow the **LiteLLM naming convention**. Any provider supported by Li
 - `gpt-4o-mini` (OpenAI)
 - `claude-3-5-sonnet` (Anthropic)
 - `anthropic/claude-3-5-sonnet` (via Anthropic's API)
-- `openrouter/google/gemini-2.0-flash-001` (via OpenRouter)
+- `openrouter/google/gemini-2.5-flash-lite` (via OpenRouter)
 - `ollama/llama3` (local Ollama)
 
 ### Provider Modes
@@ -143,9 +145,9 @@ By default (`VCF_API_PROVIDER=default` or unset), LiteLLM auto-detects the provi
 
 ```dotenv
 VCF_API_PROVIDER=default        # (or omit this entirely)
-VCF_ARCHITECT_MODEL=gpt-4o-mini
-VCF_REFEREE_MODEL=gpt-4o-mini
-OPENAI_API_KEY=sk-your-key      # auto-detected from model ID
+VCF_ARCHITECT_MODEL=openrouter/google/gemini-2.5-flash-lite
+VCF_REFEREE_MODEL=openrouter/google/gemini-2.5-flash-lite
+OPENROUTER_API_KEY=your-openrouter-api-key  # auto-detected from model ID
 VCF_REQUEST_TIMEOUT=60
 ```
 
@@ -307,11 +309,11 @@ All tests are **fully isolated**: no real LLM calls, no real network I/O. LiteLL
 
 ### Contract Validation
 
-- **Structural validation** (deterministic, no LLM call):  
-  Checks that all four required Markdown headings are present, in order, each with non-empty content
+- **Structural validation** (deterministic control flow, no LLM call):
+  Checks that all four required Markdown headings are present, in order, each with non-empty content. This check is deterministic and produces consistent results.
   
 - **Semantic validation** (performed by the Referee LLM):  
-  Detects meta-prompts, contradictions, invented project facts, vagueness, and safety concerns
+  Detects meta-prompts, contradictions, invented project facts, vagueness, and safety concerns. Results may vary between runs due to LLM non-determinism.
 
 The two-stage validation prevents invalid prompts from reaching the IDE agent and allows the pipeline to reject structurally invalid drafts without spending an LLM call.
 
@@ -325,7 +327,7 @@ The two-stage validation prevents invalid prompts from reaching the IDE agent an
 
 ## Dependencies
 
-- **Python 3.9+**
+- **Python 3.11+**
 - **pydantic** (data validation)
 - **litellm** (LLM provider abstraction)
 - **python-dotenv** (environment variable loading)
