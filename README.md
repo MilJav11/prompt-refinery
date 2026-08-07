@@ -349,6 +349,28 @@ written on `APPROVED` status.
 
 ---
 
+## GUI Application
+
+VCF includes a lightweight, single-page web GUI powered by [Streamlit](https://streamlit.io).
+
+### Launching the GUI
+
+```sh
+streamlit run gui.py
+```
+
+This will automatically open the web interface in your default browser (default: `http://localhost:8501`).
+
+### Features
+
+- **Interactive Task Input**: Enter task descriptions with instant feedback.
+- **Preset Selection**: Select model presets (`budget`, `balanced`, `deepsense`, `strict-judge`) from the sidebar.
+- **Custom Model Overrides**: Optionally override Architect or Referee models independently.
+- **Native Click-to-Copy Output**: Approved prompts and suggested fallback prompts are rendered in Markdown code blocks featuring native copy buttons.
+- **Run Metrics & Diagnostics**: View token counts, estimated costs, and detailed Referee reviews inside collapsible expanders.
+
+---
+
 ## Testing
 
 Run the full test suite:
@@ -365,7 +387,7 @@ pytest tests/test_vcf.py::TestApprovedFlow::test_approved_on_first_pass -v
 
 ### Test Coverage
 
-- **41 comprehensive unit tests** in `tests/test_vcf.py` and **12 MCP server tests** in `tests/test_mcp_server.py` (**53 total**), plus **7 unit tests** for `record_memory_entry`, **4 MCP tests** for `record_verified_outcome`, **11 preset resolution tests**, **2 pipeline preset integration tests**, **3 CLI preset tests**, and **3 MCP preset passthrough tests** (**83 total**) covering:
+- **41 comprehensive unit tests** in `tests/test_vcf.py` and **12 MCP server tests** in `tests/test_mcp_server.py` (**53 total**), plus **7 unit tests** for `record_memory_entry`, **4 MCP tests** for `record_verified_outcome`, **11 preset resolution tests**, **2 pipeline preset integration tests**, **3 CLI preset tests**, **3 MCP preset passthrough tests**, and **8 GUI unit tests** (**91 total**) covering:
   - Approved flow (first pass and after one fix cycle)
   - Reject flow (after fix attempt, prompt preservation)
   - JSON repair (malformed responses, recovery)

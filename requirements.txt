@@ -3,3 +3,5 @@ mcp>=2.0.0          # MCP Python SDK (2.0+ uses MCPServer; FastMCP was removed i
 pydantic>=2.5.0
 python-dotenv>=1.0.0
 pytest>=8.0.0
+streamlit>=1.30.0
+
