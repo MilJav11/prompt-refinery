@@ -18,6 +18,8 @@ from collections.abc import Sequence
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
+    import config  # imported here so argparse --help works even if dotenv fails
+
     parser = argparse.ArgumentParser(
         prog="vcf.py",
         description=(
@@ -45,6 +47,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=None,
         help="Per-call LLM timeout in seconds (defaults to VCF_REQUEST_TIMEOUT from .env)",
     )
+    parser.add_argument(
+        "--preset",
+        "-p",
+        default=None,
+        choices=list(config.MODEL_PRESETS.keys()),
+        help=(
+            "Model preset shortcut (e.g. 'budget', 'strict-judge'). "
+            "Explicit --architect-model / --referee-model always override a preset."
+        ),
+    )
     return parser
 
 
@@ -64,6 +76,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 architect_model=args.architect_model,
                 referee_model=args.referee_model,
                 timeout=args.timeout,
+                preset=args.preset,
             )
         )
     except Exception as exc:  # last-resort safety net: never leak a raw traceback

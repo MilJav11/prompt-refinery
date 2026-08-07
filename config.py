@@ -45,6 +45,106 @@ CONTEXT_FILENAMES: tuple[str, ...] = (
 # Directory where the final prompt / review diagnostics are written.
 ZED_DIR: str = os.getenv("VCF_ZED_DIR", ".zed")
 
+# ---------------------------------------------------------------------------
+# Model Presets
+# ---------------------------------------------------------------------------
+#
+# Convenience shortcuts for common Architect/Referee model combinations.
+# Keys are the preset names accepted by ``--preset`` (CLI) and ``preset``
+# (MCP tool parameter).  Values are ``(architect_model, referee_model)``
+# tuples.
+#
+# The "balanced" preset stores a sentinel value resolved dynamically in
+# resolve_models() so it always reflects the live ARCHITECT_MODEL /
+# REFEREE_MODEL environment-variable values, not an import-time snapshot.
+_BALANCED_SENTINEL = "__balanced__"
+
+MODEL_PRESETS: dict[str, tuple[str, str]] = {
+    "budget": (
+        "openrouter/google/gemini-2.5-flash-lite",
+        "openrouter/google/gemini-2.5-flash-lite",
+    ),
+    # "balanced" is resolved dynamically in resolve_models() to honour any
+    # runtime monkeypatching of ARCHITECT_MODEL / REFEREE_MODEL.
+    "balanced": (_BALANCED_SENTINEL, _BALANCED_SENTINEL),
+    "deepsense": (
+        "openrouter/deepseek/deepseek-chat",
+        "claude-3-5-sonnet",
+    ),
+    "strict-judge": (
+        "gpt-4o-mini",
+        "claude-3-5-sonnet",
+    ),
+}
+
+
+def resolve_models(
+    preset: str | None = None,
+    architect_model: str | None = None,
+    referee_model: str | None = None,
+) -> tuple[str, str]:
+    """Resolve the final (architect_model, referee_model) pair for a pipeline run.
+
+    Resolution priority, applied **per field independently**:
+
+    1. Explicit ``architect_model`` / ``referee_model`` argument, if provided.
+       These always win over any preset.
+    2. The value from ``MODEL_PRESETS[preset]``, if ``preset`` is given and
+       the key exists.
+    3. ``config.ARCHITECT_MODEL`` / ``config.REFEREE_MODEL`` (env-var defaults).
+
+    Parameters
+    ----------
+    preset:
+        Optional preset name from ``MODEL_PRESETS``.  If provided and not a
+        valid key, raises :exc:`ValueError` immediately -- never silently
+        falls back to the defaults.
+    architect_model:
+        Explicit Architect model override.  Wins over any preset.
+    referee_model:
+        Explicit Referee model override.  Wins over any preset.
+
+    Returns
+    -------
+    tuple[str, str]
+        ``(resolved_architect_model, resolved_referee_model)``.
+
+    Raises
+    ------
+    ValueError
+        If ``preset`` is provided but not a key in ``MODEL_PRESETS``.
+    """
+    # Validate preset name early -- do not silently fall back.
+    if preset is not None and preset not in MODEL_PRESETS:
+        valid = ", ".join(f'"{k}"' for k in MODEL_PRESETS)
+        raise ValueError(
+            f"Unknown model preset {preset!r}. "
+            f"Valid preset names are: {valid}"
+        )
+
+    # Resolve architect model: explicit arg > preset > config default.
+    if architect_model is not None:
+        resolved_arch = architect_model
+    elif preset is not None:
+        preset_arch, _ = MODEL_PRESETS[preset]
+        # "balanced" sentinel defers to the live ARCHITECT_MODEL value.
+        resolved_arch = ARCHITECT_MODEL if preset_arch == _BALANCED_SENTINEL else preset_arch
+    else:
+        resolved_arch = ARCHITECT_MODEL
+
+    # Resolve referee model: explicit arg > preset > config default.
+    if referee_model is not None:
+        resolved_ref = referee_model
+    elif preset is not None:
+        _, preset_ref = MODEL_PRESETS[preset]
+        # "balanced" sentinel defers to the live REFEREE_MODEL value.
+        resolved_ref = REFEREE_MODEL if preset_ref == _BALANCED_SENTINEL else preset_ref
+    else:
+        resolved_ref = REFEREE_MODEL
+
+    return resolved_arch, resolved_ref
+
+
 # --- Provider configuration -------------------------------------------------
 #
 # VCF_API_PROVIDER selects which credentials/endpoint LiteLLM uses:

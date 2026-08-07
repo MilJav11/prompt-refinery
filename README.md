@@ -191,6 +191,20 @@ VCF automatically loads project context from the first file found, in order:
 
 The context is truncated to `VCF_CONTEXT_MAX_CHARS` (default: 6000 characters) and injected into the Architect's prompt to provide project-specific knowledge.
 
+### Model Presets
+
+Model presets are convenience shortcuts that select a pre-defined Architect/Referee model pair in one step. They are especially useful for quickly switching between cost tiers or validation strength without remembering individual model IDs.
+
+| Preset | Architect | Referee | Best for |
+|--------|-----------|---------|----------|
+| `budget` | Gemini 2.5 Flash Lite | Gemini 2.5 Flash Lite | Fast, economical runs |
+| `balanced` | `VCF_ARCHITECT_MODEL` (env default) | `VCF_REFEREE_MODEL` (env default) | Equivalent to no preset |
+| `deepsense` | DeepSeek Chat | Claude 3.5 Sonnet | Strong cross-model checking |
+| `strict-judge` | GPT-4o-mini | Claude 3.5 Sonnet | Rigorous semantic validation |
+
+**Override priority (applied per field independently):**
+> Explicit `--architect-model` / `--referee-model` (CLI) or `architect_model` / `referee_model` (MCP) **always win** over any preset. You can mix a preset with a per-field override, e.g. use the `budget` preset but substitute a custom Referee.
+
 ---
 
 ## CLI Usage
@@ -211,8 +225,9 @@ This will:
 ### Command-Line Options
 
 ```
-usage: vcf.py [-h] [--architect-model ARCHITECT_MODEL] 
-              [--referee-model REFEREE_MODEL] [--timeout TIMEOUT] 
+usage: vcf.py [-h] [--architect-model ARCHITECT_MODEL]
+              [--referee-model REFEREE_MODEL] [--timeout TIMEOUT]
+              [--preset {budget,balanced,deepsense,strict-judge}]
               task
 
 positional arguments:
@@ -221,10 +236,12 @@ positional arguments:
 optional arguments:
   -h, --help            Show this help message and exit
   --architect-model ARCHITECT_MODEL
-                        Override VCF_ARCHITECT_MODEL
+                        Override VCF_ARCHITECT_MODEL (always beats --preset)
   --referee-model REFEREE_MODEL
-                        Override VCF_REFEREE_MODEL
+                        Override VCF_REFEREE_MODEL (always beats --preset)
   --timeout TIMEOUT     Override VCF_REQUEST_TIMEOUT (seconds)
+  --preset, -p {budget,balanced,deepsense,strict-judge}
+                        Model preset shortcut
 ```
 
 ### Example Commands
@@ -233,7 +250,13 @@ optional arguments:
 # Default: use .env configuration
 python vcf.py "Refactor authentication logic"
 
-# Override models for a specific run
+# Use a preset for a fast, cheap run
+python vcf.py "Add retry logic" --preset budget
+
+# Use a preset but override just the Referee for extra rigour
+python vcf.py "Add retry logic" --preset budget --referee-model claude-3-5-sonnet
+
+# Override models explicitly (ignores any preset)
 python vcf.py "Add unit tests" \
   --architect-model anthropic/claude-3-5-sonnet \
   --referee-model gpt-4o
@@ -342,7 +365,7 @@ pytest tests/test_vcf.py::TestApprovedFlow::test_approved_on_first_pass -v
 
 ### Test Coverage
 
-- **41 comprehensive unit tests** in `tests/test_vcf.py` and **12 MCP server tests** in `tests/test_mcp_server.py` (**53 total**), plus **7 unit tests** for `record_memory_entry` and **4 MCP tests** for `record_verified_outcome` (**64 total**) covering:
+- **41 comprehensive unit tests** in `tests/test_vcf.py` and **12 MCP server tests** in `tests/test_mcp_server.py` (**53 total**), plus **7 unit tests** for `record_memory_entry`, **4 MCP tests** for `record_verified_outcome`, **11 preset resolution tests**, **2 pipeline preset integration tests**, **3 CLI preset tests**, and **3 MCP preset passthrough tests** (**83 total**) covering:
   - Approved flow (first pass and after one fix cycle)
   - Reject flow (after fix attempt, prompt preservation)
   - JSON repair (malformed responses, recovery)
@@ -375,6 +398,14 @@ All tests are **fully isolated**: no real LLM calls, no real network I/O. LiteLL
   Detects meta-prompts, contradictions, invented project facts, vagueness, and safety concerns. Results may vary between runs due to LLM non-determinism.
 
 The two-stage validation prevents invalid prompts from reaching the IDE agent and allows the pipeline to reject structurally invalid drafts without spending an LLM call.
+
+### Referee Anti-bias Calibration
+
+The `REFEREE_SYSTEM_PROMPT` includes an explicit **anti-bias calibration paragraph** added after the Prompt Contract v1 rejection rules:
+
+> *Act as an unsparing, independent technical editor. A draft's fluency, length, or confident tone is not evidence of correctness — evaluate it solely against the concrete Prompt Contract v1 rules listed above. Do not assume the Architect is correct merely because its output looks well-structured or uses sophisticated phrasing; conversely, do not penalise a draft for being terse if it is otherwise fully compliant and correct. Judge content purely against Prompt Contract v1 criteria, regardless of which underlying model produced the draft or how that model's writing style differs from other models.*
+
+This is particularly important when using cross-model presets like `deepsense` or `strict-judge`, where the Referee and Architect are from different model families and have different stylistic tendencies.
 
 ### Suggested Fallback Prompt
 

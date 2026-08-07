@@ -73,6 +73,7 @@ async def refine_prompt(
     referee_model: str | None = None,
     timeout: float | None = None,
     context_dir: str = ".",
+    preset: str | None = None,
 ) -> dict[str, Any]:
     """Refine a raw task description into a validated, structured prompt for an AI IDE agent.
 
@@ -91,10 +92,11 @@ async def refine_prompt(
     architect_model:
         LiteLLM model ID for the Architect (draft generation).  Defaults to
         the ``VCF_ARCHITECT_MODEL`` environment variable (fallback:
-        ``gpt-4o-mini``).
+        ``gpt-4o-mini``).  **Always overrides ``preset`` when both are given.**
     referee_model:
         LiteLLM model ID for the Referee (validation).  Defaults to the
         ``VCF_REFEREE_MODEL`` environment variable (fallback: ``gpt-4o-mini``).
+        **Always overrides ``preset`` when both are given.**
     timeout:
         Per-call LLM timeout in seconds.  Defaults to the
         ``VCF_REQUEST_TIMEOUT`` environment variable (fallback: ``60``).
@@ -102,6 +104,21 @@ async def refine_prompt(
         Directory from which to load project context (``PROJECT_CONTEXT.md``
         or ``docs/MEMORY.md``).  Defaults to ``"."`` (current working
         directory).
+    preset:
+        Optional model preset shortcut.  Available presets:
+
+        - ``"budget"``       — Architect: Gemini 2.5 Flash Lite,
+          Referee: Gemini 2.5 Flash Lite (fast, economical).
+        - ``"balanced"``     — Architect: env-default, Referee: env-default
+          (equivalent to passing no preset).
+        - ``"deepsense"``    — Architect: DeepSeek Chat,
+          Referee: Claude 3.5 Sonnet (strong cross-model checking).
+        - ``"strict-judge"`` — Architect: GPT-4o-mini,
+          Referee: Claude 3.5 Sonnet (rigorous semantic validation).
+
+        Explicit ``architect_model`` / ``referee_model`` arguments always
+        take priority over the preset, resolved per-field independently.
+        An invalid preset name returns an ``ERROR`` result immediately.
 
     Returns
     -------
@@ -139,6 +156,7 @@ async def refine_prompt(
             timeout=timeout,
             context_dir=context_dir,
             zed_dir=zed_dir,
+            preset=preset,
         )
     except Exception as exc:  # noqa: BLE001 — safety net; run_pipeline already handles most
         # Catch any unexpected exception that escaped run_pipeline's own

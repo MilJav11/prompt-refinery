@@ -1263,3 +1263,219 @@ class TestRecordMemoryEntry:
 
         assert result.is_absolute()
         assert result == memory_path.resolve()
+
+
+# ---------------------------------------------------------------------------
+# Tests: config.resolve_models
+# ---------------------------------------------------------------------------
+
+
+class TestResolveModels:
+    """Unit tests for ``config.resolve_models`` — pure resolution logic, no I/O."""
+
+    def test_budget_preset_resolves_both_models(self, monkeypatch):
+        """'budget' preset resolves both Architect and Referee to Gemini Flash Lite."""
+        arch, ref = config.resolve_models(preset="budget")
+        assert arch == "openrouter/google/gemini-2.5-flash-lite"
+        assert ref == "openrouter/google/gemini-2.5-flash-lite"
+
+    def test_balanced_preset_uses_config_defaults(self, monkeypatch):
+        """'balanced' preset defers to the live ARCHITECT_MODEL / REFEREE_MODEL values."""
+        monkeypatch.setattr(config, "ARCHITECT_MODEL", "my-arch-model")
+        monkeypatch.setattr(config, "REFEREE_MODEL", "my-ref-model")
+        arch, ref = config.resolve_models(preset="balanced")
+        assert arch == "my-arch-model"
+        assert ref == "my-ref-model"
+
+    def test_deepsense_preset(self, monkeypatch):
+        """'deepsense' preset pairs DeepSeek Chat (Architect) with Claude Sonnet (Referee)."""
+        arch, ref = config.resolve_models(preset="deepsense")
+        assert arch == "openrouter/deepseek/deepseek-chat"
+        assert ref == "claude-3-5-sonnet"
+
+    def test_strict_judge_preset(self, monkeypatch):
+        """'strict-judge' preset pairs GPT-4o-mini (Architect) with Claude Sonnet (Referee)."""
+        arch, ref = config.resolve_models(preset="strict-judge")
+        assert arch == "gpt-4o-mini"
+        assert ref == "claude-3-5-sonnet"
+
+    def test_explicit_architect_override_beats_preset(self, monkeypatch):
+        """Explicit architect_model wins over the preset value; referee comes from preset."""
+        arch, ref = config.resolve_models(
+            preset="budget",
+            architect_model="my-custom-architect",
+        )
+        assert arch == "my-custom-architect"
+        assert ref == "openrouter/google/gemini-2.5-flash-lite"  # from budget preset
+
+    def test_explicit_referee_override_beats_preset(self, monkeypatch):
+        """Explicit referee_model wins over the preset value; architect comes from preset."""
+        arch, ref = config.resolve_models(
+            preset="budget",
+            referee_model="my-custom-referee",
+        )
+        assert arch == "openrouter/google/gemini-2.5-flash-lite"  # from budget preset
+        assert ref == "my-custom-referee"
+
+    def test_both_explicit_overrides_beat_preset(self, monkeypatch):
+        """Both explicit overrides win; preset has no influence."""
+        arch, ref = config.resolve_models(
+            preset="strict-judge",
+            architect_model="custom-arch",
+            referee_model="custom-ref",
+        )
+        assert arch == "custom-arch"
+        assert ref == "custom-ref"
+
+    def test_explicit_override_without_preset(self, monkeypatch):
+        """Explicit overrides work when no preset is given."""
+        arch, ref = config.resolve_models(
+            architect_model="explicit-arch",
+            referee_model="explicit-ref",
+        )
+        assert arch == "explicit-arch"
+        assert ref == "explicit-ref"
+
+    def test_no_args_falls_back_to_config_defaults(self, monkeypatch):
+        """With no arguments, falls back to config.ARCHITECT_MODEL / config.REFEREE_MODEL."""
+        monkeypatch.setattr(config, "ARCHITECT_MODEL", "default-arch")
+        monkeypatch.setattr(config, "REFEREE_MODEL", "default-ref")
+        arch, ref = config.resolve_models()
+        assert arch == "default-arch"
+        assert ref == "default-ref"
+
+    def test_unknown_preset_raises_value_error(self, monkeypatch):
+        """An unrecognised preset name raises ValueError immediately."""
+        with pytest.raises(ValueError, match="Unknown model preset"):
+            config.resolve_models(preset="nonexistent-preset")
+
+    def test_unknown_preset_error_lists_valid_names(self, monkeypatch):
+        """The ValueError message lists all valid preset names."""
+        with pytest.raises(ValueError) as exc_info:
+            config.resolve_models(preset="bad-preset")
+        msg = str(exc_info.value)
+        for name in config.MODEL_PRESETS:
+            assert name in msg, f"Expected {name!r} in error message: {msg}"
+
+
+# ---------------------------------------------------------------------------
+# Tests: preset integration in run_pipeline
+# ---------------------------------------------------------------------------
+
+
+class TestPresetInPipeline:
+    """Invalid preset → clean ERROR RunResult, no LLM calls made."""
+
+    def test_invalid_preset_yields_error_result_no_llm_call(self, tmp_path, monkeypatch):
+        """An invalid preset name causes an ERROR RunResult without any LLM call."""
+        mock = AsyncMock()
+        monkeypatch.setattr(orchestrator.litellm, "acompletion", mock)
+
+        zed_dir = tmp_path / ".zed"
+        result = run_pipeline(
+            "task",
+            preset="not-a-real-preset",
+            architect_model=None,
+            referee_model=None,
+            context_dir=tmp_path,
+            zed_dir=zed_dir,
+        )
+
+        assert result.status == "ERROR"
+        assert "not-a-real-preset" in result.diagnostic_info.get("error", "")
+        assert mock.await_count == 0, "LLM must not be called for an invalid preset"
+        assert not (zed_dir / "prompt.md").exists()
+        # review.md should record the error
+        assert (zed_dir / "review.md").exists()
+
+    def test_valid_preset_passes_correct_models_to_litellm(self, tmp_path, monkeypatch):
+        """A valid preset ('budget') is resolved and its model IDs reach LiteLLM."""
+        expected_arch = "openrouter/google/gemini-2.5-flash-lite"
+        expected_prompt = compliant_prompt("via budget preset")
+        mock = AsyncMock(
+            side_effect=[
+                llm_response(draft_json(prompt=expected_prompt)),
+                llm_response(review_json(status="APPROVED")),
+            ]
+        )
+        monkeypatch.setattr(orchestrator.litellm, "acompletion", mock)
+
+        zed_dir = tmp_path / ".zed"
+        result = run_pipeline(
+            "task",
+            preset="budget",
+            context_dir=tmp_path,
+            zed_dir=zed_dir,
+        )
+
+        assert result.status == "APPROVED"
+        # Both LLM calls must use the budget preset's model ID.
+        for call in mock.await_args_list:
+            assert call.kwargs["model"] == expected_arch
+
+
+# ---------------------------------------------------------------------------
+# Tests: --preset CLI flag
+# ---------------------------------------------------------------------------
+
+
+class TestCliPreset:
+    """CLI parsing and passthrough for --preset / -p."""
+
+    def test_preset_budget_parsed_and_forwarded(self, tmp_path, monkeypatch):
+        """--preset budget is accepted and forwarded to run_pipeline."""
+        monkeypatch.chdir(tmp_path)
+        expected_prompt = compliant_prompt("budget run")
+        mock = AsyncMock(
+            side_effect=[
+                llm_response(draft_json(prompt=expected_prompt)),
+                llm_response(review_json(status="APPROVED")),
+            ]
+        )
+        monkeypatch.setattr(orchestrator.litellm, "acompletion", mock)
+
+        exit_code = vcf.main(["some task", "--preset", "budget"])
+
+        assert exit_code == 0
+        # Both calls must have used the budget model.
+        for call in mock.await_args_list:
+            assert call.kwargs["model"] == "openrouter/google/gemini-2.5-flash-lite"
+
+    def test_explicit_architect_model_overrides_preset(self, tmp_path, monkeypatch):
+        """--architect-model overrides --preset for the architect field only."""
+        monkeypatch.chdir(tmp_path)
+        expected_prompt = compliant_prompt("override test")
+        mock = AsyncMock(
+            side_effect=[
+                llm_response(draft_json(prompt=expected_prompt)),
+                llm_response(review_json(status="APPROVED")),
+            ]
+        )
+        monkeypatch.setattr(orchestrator.litellm, "acompletion", mock)
+
+        exit_code = vcf.main(
+            ["some task", "--preset", "budget", "--architect-model", "my-custom-model"]
+        )
+
+        assert exit_code == 0
+        calls = mock.await_args_list
+        # First call is architect (my-custom-model wins over budget preset).
+        assert calls[0].kwargs["model"] == "my-custom-model"
+        # Second call is referee (budget preset's referee, no override given).
+        assert calls[1].kwargs["model"] == "openrouter/google/gemini-2.5-flash-lite"
+
+    def test_short_flag_p_accepted(self, tmp_path, monkeypatch):
+        """-p is accepted as an alias for --preset."""
+        monkeypatch.chdir(tmp_path)
+        expected_prompt = compliant_prompt("short flag")
+        mock = AsyncMock(
+            side_effect=[
+                llm_response(draft_json(prompt=expected_prompt)),
+                llm_response(review_json(status="APPROVED")),
+            ]
+        )
+        monkeypatch.setattr(orchestrator.litellm, "acompletion", mock)
+
+        exit_code = vcf.main(["some task", "-p", "balanced"])
+
+        assert exit_code == 0

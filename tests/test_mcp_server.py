@@ -451,3 +451,61 @@ class TestRecordVerifiedOutcome:
             )
         )
         assert capsys.readouterr().out == ""
+
+
+# ---------------------------------------------------------------------------
+# Tests: preset passthrough in refine_prompt MCP tool
+# ---------------------------------------------------------------------------
+
+
+class TestRefinePromptPreset:
+    """refine_prompt forwards the preset parameter to run_pipeline correctly."""
+
+    def test_preset_forwarded_to_run_pipeline(self, tmp_path, capsys):
+        """refine_prompt(preset='budget') passes preset='budget' to run_pipeline."""
+        fake_result = _approved_result(tmp_path)
+        mock_pipeline = AsyncMock(return_value=fake_result)
+
+        with patch.object(mcp_server, "run_pipeline", new=mock_pipeline):
+            response = run_async(
+                mcp_server.refine_prompt(task="some task", preset="budget")
+            )
+
+        assert response["status"] == "APPROVED"
+        mock_pipeline.assert_awaited_once()
+        _, kwargs = mock_pipeline.await_args
+        assert kwargs.get("preset") == "budget"
+
+        # No stdout output.
+        assert capsys.readouterr().out == ""
+
+    def test_no_preset_forwards_none(self, tmp_path, capsys):
+        """refine_prompt called without preset passes preset=None to run_pipeline."""
+        fake_result = _approved_result(tmp_path)
+        mock_pipeline = AsyncMock(return_value=fake_result)
+
+        with patch.object(mcp_server, "run_pipeline", new=mock_pipeline):
+            run_async(mcp_server.refine_prompt(task="some task"))
+
+        _, kwargs = mock_pipeline.await_args
+        assert kwargs.get("preset") is None
+        assert capsys.readouterr().out == ""
+
+    def test_preset_with_explicit_model_override(self, tmp_path, capsys):
+        """preset and architect_model can coexist — both forwarded to run_pipeline."""
+        fake_result = _approved_result(tmp_path)
+        mock_pipeline = AsyncMock(return_value=fake_result)
+
+        with patch.object(mcp_server, "run_pipeline", new=mock_pipeline):
+            run_async(
+                mcp_server.refine_prompt(
+                    task="some task",
+                    preset="strict-judge",
+                    architect_model="my-override",
+                )
+            )
+
+        _, kwargs = mock_pipeline.await_args
+        assert kwargs.get("preset") == "strict-judge"
+        assert kwargs.get("architect_model") == "my-override"
+        assert capsys.readouterr().out == ""

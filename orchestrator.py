@@ -108,6 +108,17 @@ You MUST return "REJECT" when ANY of the following is true:
 Also reject drafts that are vague, unsafe, or otherwise missing critical \
 information.
 
+ANTI-BIAS CALIBRATION (read carefully before rendering your verdict):
+Act as an unsparing, independent technical editor. A draft's fluency, length, \
+or confident tone is not evidence of correctness — evaluate it solely against \
+the concrete Prompt Contract v1 rules listed above.
+Do not assume the Architect is correct merely because its output looks \
+well-structured or uses sophisticated phrasing; conversely, do not penalise a \
+draft for being terse if it is otherwise fully compliant and correct.
+Judge content purely against Prompt Contract v1 criteria, regardless of which \
+underlying model produced the draft or how that model's writing style differs \
+from other models.
+
 When your verdict is "REJECT", you SHOULD also provide a complete, best-effort \
 corrected version of the zed_prompt in "suggested_prompt". This corrected \
 prompt must satisfy Prompt Contract v1 (all four mandatory sections present, \
@@ -781,6 +792,7 @@ async def run_pipeline(
     timeout: float | None = None,
     context_dir: str | Path = ".",
     zed_dir: str | Path = config.ZED_DIR,
+    preset: str | None = None,
 ) -> RunResult:
     """Run the full Architect -> Referee -> Fix -> Re-check loop.
 
@@ -793,9 +805,15 @@ async def run_pipeline(
     Token usage and estimated USD cost are accumulated across every LLM call
     made during the run. Partial metrics (from calls that succeeded before an
     error) are preserved even on the ERROR path.
+
+    Parameters
+    ----------
+    preset:
+        Optional model preset name (e.g. ``"budget"``, ``"strict-judge"``).
+        Resolved via ``config.resolve_models``; explicit ``architect_model`` /
+        ``referee_model`` arguments always take priority over the preset.
+        An unknown preset name causes an immediate ERROR ``RunResult``.
     """
-    architect_model = architect_model or config.ARCHITECT_MODEL
-    referee_model = referee_model or config.REFEREE_MODEL
     timeout = timeout if timeout is not None else config.REQUEST_TIMEOUT
 
     diagnostic_info: dict[str, Any] = {"task": task, "drafts": [], "reviews": []}
@@ -803,6 +821,25 @@ async def run_pipeline(
     # Instantiated BEFORE the try block so the accumulator survives into the
     # except handler and partial metrics from successful calls are not lost.
     metrics = PipelineMetrics()
+
+    # Resolve models via config.resolve_models so that preset, explicit overrides,
+    # and env-var defaults are applied with the documented priority order.
+    # ValueError on an unknown preset name is caught here and returned as ERROR.
+    try:
+        architect_model, referee_model = config.resolve_models(
+            preset=preset,
+            architect_model=architect_model,
+            referee_model=referee_model,
+        )
+    except ValueError as exc:
+        diagnostic_info["status"] = "ERROR"
+        diagnostic_info["error"] = str(exc)
+        diagnostic_info["metrics"] = metrics.to_dict()
+        try:
+            write_review(diagnostic_info, zed_dir)
+        except OSError:
+            pass
+        return RunResult(final_prompt=None, status="ERROR", diagnostic_info=diagnostic_info)
 
     try:
         context = load_ssot_context(context_dir)
