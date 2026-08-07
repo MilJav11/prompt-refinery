@@ -342,7 +342,7 @@ pytest tests/test_vcf.py::TestApprovedFlow::test_approved_on_first_pass -v
 
 ### Test Coverage
 
-- **41 comprehensive unit tests** in `tests/test_vcf.py` and **12 MCP server tests** in `tests/test_mcp_server.py` (**53 total**) covering:
+- **41 comprehensive unit tests** in `tests/test_vcf.py` and **12 MCP server tests** in `tests/test_mcp_server.py` (**53 total**), plus **7 unit tests** for `record_memory_entry` and **4 MCP tests** for `record_verified_outcome` (**64 total**) covering:
   - Approved flow (first pass and after one fix cycle)
   - Reject flow (after fix attempt, prompt preservation)
   - JSON repair (malformed responses, recovery)
@@ -436,6 +436,60 @@ raw task description and returns a structured result.
 - `details_path` points to `.zed/prompt.md` on `APPROVED`, `.zed/review.md` on `REJECT`/`ERROR`.  
   The calling IDE agent can read this file directly for full diagnostic detail.
 - API keys and secrets are **never** included in the returned dict.
+
+---
+
+### `record_verified_outcome` Tool
+
+> ⚠️ **This tool must ONLY be called after real, verified implementation work.**
+> It must NEVER be called immediately after `refine_prompt` returns a prompt.
+> A prompt is a specification to be executed — not a completed implementation.
+
+**Description:** Appends a structured, dated entry to `docs/MEMORY.md` recording
+the outcome of a completed and verified implementation task. This file accumulates
+over time and is automatically read as project context (SSOT) on future
+`refine_prompt` runs via the existing `load_ssot_context` fallback order
+(`PROJECT_CONTEXT.md` first, then `docs/MEMORY.md`). No additional wiring is required.
+
+**The correct calling sequence is:**
+1. Call `refine_prompt` → get a validated prompt.
+2. The IDE agent (or a human) executes that prompt and implements the change.
+3. Tests run and pass (or the outcome is otherwise confirmed).
+4. **Only then** call `record_verified_outcome` to record what happened.
+
+**Parameters:**
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `task` | `str` | *(required)* | Short description of the implemented task (becomes the entry heading) |
+| `outcome` | `str` | *(required)* | One of `"verified_success"`, `"verified_partial"`, or `"abandoned"` |
+| `notes` | `str` | *(required)* | Free-text notes. **Do NOT include API keys or secrets** — written verbatim to a tracked file |
+| `files_touched` | `list[str] \| null` | `null` | Optional list of file paths created or modified |
+
+**Return shape:**
+
+On success:
+```json
+{ "status": "OK", "memory_path": "/abs/path/to/docs/MEMORY.md" }
+```
+
+On error (invalid outcome or file write failure):
+```json
+{ "status": "ERROR", "error": "<human-readable message>" }
+```
+
+**`docs/MEMORY.md` entry format:**
+
+```markdown
+## 2026-08-07 — Add retry logic to connection handler
+
+- **Outcome:** verified_success
+- **Notes:** All 53 tests pass. No regressions.
+- **Files touched:** `orchestrator.py`, `mcp_server.py`
+```
+
+Entries are appended chronologically (most-recent-last), so the file reads as a
+human-friendly history of confirmed project changes.
 
 ### Running the Server
 

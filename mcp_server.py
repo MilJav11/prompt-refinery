@@ -51,7 +51,7 @@ from mcp.server.mcpserver import MCPServer  # noqa: E402
 # --- Orchestrator imports ----------------------------------------------------
 # Import only from orchestrator.py, never from vcf.py (vcf.py prints to
 # stdout as part of its CLI contract, which would corrupt the stdio stream).
-from orchestrator import format_metrics_summary, run_pipeline  # noqa: E402
+from orchestrator import format_metrics_summary, record_memory_entry, run_pipeline  # noqa: E402
 
 import config  # noqa: E402
 
@@ -174,6 +174,108 @@ async def refine_prompt(
         "details_path": details_path,
         "error": error_msg,
     }
+
+
+# ---------------------------------------------------------------------------
+# Tool: record_verified_outcome
+# ---------------------------------------------------------------------------
+
+_VALID_OUTCOMES: frozenset[str] = frozenset(
+    {"verified_success", "verified_partial", "abandoned"}
+)
+
+
+@mcp.tool()
+async def record_verified_outcome(
+    task: str,
+    outcome: str,
+    notes: str,
+    files_touched: list[str] | None = None,
+) -> dict:
+    """Record a verified implementation outcome to docs/MEMORY.md.
+
+    ⚠️  IMPORTANT — CALLING AGENT MUST READ THIS BEFORE INVOKING:
+    ---------------------------------------------------------------
+    This tool MUST ONLY be called after real implementation work has been
+    completed AND independently verified (e.g. the test suite passed, the
+    build succeeded, or a human confirmed the change is working correctly).
+
+    It must NEVER be called:
+    - Immediately after ``refine_prompt`` returns a prompt (a prompt is NOT
+      a completed implementation — it is a specification still to be executed).
+    - Automatically as a side effect of any other tool.
+    - Speculatively, before the implementation is actually done and confirmed.
+
+    The only correct sequence is:
+      1. Call ``refine_prompt`` → get a validated prompt.
+      2. The IDE agent (or a human) executes that prompt and implements the change.
+      3. Tests run and pass (or the outcome is otherwise confirmed).
+      4. THEN call ``record_verified_outcome`` to record what happened.
+
+    Parameters
+    ----------
+    task:
+        Short description of the implemented task (becomes the entry heading
+        in ``docs/MEMORY.md``, e.g. ``"Add retry logic to connection handler"``).
+    outcome:
+        One of:
+        - ``"verified_success"``  — implementation complete and all tests pass.
+        - ``"verified_partial"``  — partially implemented; describe gaps in notes.
+        - ``"abandoned"``         — work was abandoned; describe reason in notes.
+    notes:
+        Free-text description of what was done, what was skipped, and any
+        important decisions or caveats.  **Do NOT include API keys, tokens, or
+        other secrets in this field** — the notes are written verbatim to a
+        tracked file.
+    files_touched:
+        Optional list of file paths that were created or modified during the
+        implementation.  Omit or pass null if not applicable.
+
+    Returns
+    -------
+    dict with keys:
+
+    ``status`` : str
+        ``"OK"`` on success.  ``"ERROR"`` if the outcome value is invalid or
+        the file write failed.
+    ``memory_path`` : str (only on ``"OK"``)
+        Absolute path to the ``docs/MEMORY.md`` file that was written.
+    ``error`` : str (only on ``"ERROR"``)
+        Human-readable error message.  Never contains secrets.
+    """
+    _log.info(
+        "record_verified_outcome called: task=%r outcome=%r",
+        task[:80],
+        outcome,
+    )
+
+    if outcome not in _VALID_OUTCOMES:
+        _log.warning("record_verified_outcome: invalid outcome %r", outcome)
+        return {
+            "status": "ERROR",
+            "error": (
+                f"Invalid outcome {outcome!r}. "
+                f"Must be one of: {', '.join(sorted(_VALID_OUTCOMES))}"
+            ),
+        }
+
+    try:
+        written_path = record_memory_entry(
+            task=task,
+            outcome=outcome,
+            notes=notes,
+            files_touched=files_touched,
+            # memory_path defaults to "docs/MEMORY.md" relative to CWD.
+        )
+    except Exception as exc:  # noqa: BLE001 — safety net; never crash the MCP server
+        _log.exception("record_verified_outcome: failed to write memory entry: %s", exc)
+        return {
+            "status": "ERROR",
+            "error": f"Failed to write memory entry: {type(exc).__name__}: {exc}",
+        }
+
+    _log.info("record_verified_outcome: wrote entry to %s", written_path)
+    return {"status": "OK", "memory_path": str(written_path)}
 
 
 # ---------------------------------------------------------------------------

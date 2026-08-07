@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import Any, cast
 
@@ -875,3 +876,98 @@ async def run_pipeline(
         except OSError:
             pass
         return RunResult(final_prompt=None, status="ERROR", diagnostic_info=diagnostic_info)
+
+
+_ALLOWED_OUTCOMES: frozenset[str] = frozenset(
+    {"verified_success", "verified_partial", "abandoned"}
+)
+
+_MEMORY_HEADER = """\
+# Project Memory — Verified Code Factory
+
+This file accumulates verified implementation outcomes for the prompt-refinery
+project. It is written to exclusively by the `record_verified_outcome` MCP tool
+(only after real implementation work has been confirmed) and is automatically
+read as project context by `load_ssot_context` on future `refine_prompt` runs.
+
+---
+"""
+
+
+def record_memory_entry(
+    task: str,
+    outcome: str,
+    notes: str,
+    files_touched: list[str] | None = None,
+    memory_path: str | Path = "docs/MEMORY.md",
+) -> Path:
+    """Append a structured, dated entry to the project memory file.
+
+    This is a deterministic, local file-append operation — it performs no LLM
+    call and has no side effects beyond writing to ``memory_path``.  It is safe
+    and cheap to call after a real implementation has been confirmed.
+
+    The written file is automatically picked up as SSOT project context on
+    future ``run_pipeline`` / ``refine_prompt`` invocations via the existing
+    ``load_ssot_context`` fallback order (``PROJECT_CONTEXT.md`` first, then
+    ``docs/MEMORY.md``).  No additional wiring is required.
+
+    Parameters
+    ----------
+    task:
+        Short description of the implemented task (used as the entry heading).
+    outcome:
+        One of ``"verified_success"``, ``"verified_partial"``, or
+        ``"abandoned"``.  Validated by the caller (``record_verified_outcome``)
+        before this function is invoked.
+    notes:
+        Free-text notes about what was done, what was skipped, and any
+        important decisions.
+
+        .. warning::
+            **Callers are responsible for not passing secrets in ``notes``.**
+            This function does not sanitise the text for API keys, tokens, or
+            other sensitive values.  Never include environment variable values,
+            ``sk-*`` keys, or long hex/base64 blobs in the notes string.
+
+    files_touched:
+        Optional list of file paths modified during the implementation.  When
+        provided, rendered as a backtick-delimited, comma-separated list.
+    memory_path:
+        Path to the memory file.  Defaults to ``"docs/MEMORY.md"`` (relative
+        to the current working directory).  Created (along with any missing
+        parent directories) if it does not already exist.
+
+    Returns
+    -------
+    pathlib.Path
+        Absolute path to the memory file that was written.
+    """
+    path = Path(memory_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Create the file with a descriptive header on first use.
+    if not path.exists():
+        path.write_text(_MEMORY_HEADER, encoding="utf-8")
+
+    date_str = datetime.now().strftime("%Y-%m-%d")
+    # Truncate the task to a reasonable heading length.
+    short_task = task[:120].strip()
+
+    files_line = ""
+    if files_touched:
+        backtick_list = ", ".join(f"`{f}`" for f in files_touched)
+        files_line = f"- **Files touched:** {backtick_list}\n"
+
+    entry = (
+        f"\n## {date_str} \u2014 {short_task}\n"
+        f"\n"
+        f"- **Outcome:** {outcome}\n"
+        f"- **Notes:** {notes}\n"
+        f"{files_line}"
+    )
+
+    with path.open("a", encoding="utf-8") as fh:
+        fh.write(entry)
+
+    return path.resolve()

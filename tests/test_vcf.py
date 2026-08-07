@@ -1131,3 +1131,135 @@ class TestCostAndTokenTracking:
         assert exit_code == 0
         captured = capsys.readouterr()
         assert "[VCF] Tokens used: unavailable" in captured.out
+
+
+# ---------------------------------------------------------------------------
+# Tests: record_memory_entry (pure function, no MCP layer)
+# ---------------------------------------------------------------------------
+
+
+class TestRecordMemoryEntry:
+    """Unit tests for ``orchestrator.record_memory_entry``.
+
+    All tests use ``tmp_path`` only.  The real ``docs/MEMORY.md`` in the
+    project root is NEVER read or written by these tests.
+    """
+
+    def test_creates_file_with_header_and_entry(self, tmp_path):
+        """On first call, creates the file with a header and the entry."""
+        memory_path = tmp_path / "docs" / "MEMORY.md"
+
+        orchestrator.record_memory_entry(
+            task="Add retry logic",
+            outcome="verified_success",
+            notes="Tests pass.",
+            memory_path=memory_path,
+        )
+
+        assert memory_path.exists()
+        content = memory_path.read_text(encoding="utf-8")
+        # Header should be present.
+        assert "# Project Memory" in content
+        # Entry content.
+        assert "Add retry logic" in content
+        assert "verified_success" in content
+        assert "Tests pass." in content
+
+    def test_appends_second_entry_without_overwriting_first(self, tmp_path):
+        """A second call appends; the first entry is still present."""
+        memory_path = tmp_path / "docs" / "MEMORY.md"
+
+        orchestrator.record_memory_entry(
+            task="First task",
+            outcome="verified_success",
+            notes="First notes.",
+            memory_path=memory_path,
+        )
+        orchestrator.record_memory_entry(
+            task="Second task",
+            outcome="abandoned",
+            notes="Second notes.",
+            memory_path=memory_path,
+        )
+
+        content = memory_path.read_text(encoding="utf-8")
+        assert "First task" in content
+        assert "First notes." in content
+        assert "Second task" in content
+        assert "Second notes." in content
+        # Two dated entry headings should be present.
+        assert content.count("## ") >= 2
+
+    def test_entry_contains_todays_date(self, tmp_path):
+        """The entry heading contains today's date in YYYY-MM-DD format."""
+        from datetime import datetime
+
+        memory_path = tmp_path / "docs" / "MEMORY.md"
+        orchestrator.record_memory_entry(
+            task="Date format check",
+            outcome="verified_success",
+            notes="Checking date.",
+            memory_path=memory_path,
+        )
+
+        today = datetime.now().strftime("%Y-%m-%d")
+        content = memory_path.read_text(encoding="utf-8")
+        assert today in content, f"Expected today's date {today!r} in entry"
+
+    def test_files_touched_rendered_as_backtick_list(self, tmp_path):
+        """When files_touched is provided, each file is wrapped in backticks."""
+        memory_path = tmp_path / "docs" / "MEMORY.md"
+        orchestrator.record_memory_entry(
+            task="Multi-file task",
+            outcome="verified_partial",
+            notes="Some files changed.",
+            files_touched=["orchestrator.py", "mcp_server.py"],
+            memory_path=memory_path,
+        )
+
+        content = memory_path.read_text(encoding="utf-8")
+        assert "`orchestrator.py`" in content
+        assert "`mcp_server.py`" in content
+        assert "Files touched" in content
+
+    def test_files_touched_none_omits_bullet(self, tmp_path):
+        """When files_touched is None, no 'Files touched' bullet is written."""
+        memory_path = tmp_path / "docs" / "MEMORY.md"
+        orchestrator.record_memory_entry(
+            task="No files",
+            outcome="abandoned",
+            notes="Abandoned early.",
+            files_touched=None,
+            memory_path=memory_path,
+        )
+
+        content = memory_path.read_text(encoding="utf-8")
+        assert "Files touched" not in content
+
+    def test_creates_docs_directory_if_missing(self, tmp_path):
+        """The docs/ parent directory is created automatically if it does not exist."""
+        memory_path = tmp_path / "docs" / "MEMORY.md"
+        assert not (tmp_path / "docs").exists(), "Precondition: docs/ should not exist yet"
+
+        orchestrator.record_memory_entry(
+            task="Dir creation test",
+            outcome="verified_success",
+            notes="Directory was created.",
+            memory_path=memory_path,
+        )
+
+        assert (tmp_path / "docs").is_dir()
+        assert memory_path.exists()
+
+    def test_returns_resolved_path(self, tmp_path):
+        """The return value is an absolute (resolved) Path to the written file."""
+        memory_path = tmp_path / "docs" / "MEMORY.md"
+        result = orchestrator.record_memory_entry(
+            task="Return value check",
+            outcome="verified_success",
+            notes="Checking return.",
+            memory_path=memory_path,
+        )
+
+        assert result.is_absolute()
+        assert result == memory_path.resolve()

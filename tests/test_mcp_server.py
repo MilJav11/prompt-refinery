@@ -329,3 +329,125 @@ class TestRefinePromptPassthrough:
         assert kwargs.get("architect_model") is None
         assert kwargs.get("referee_model") is None
         assert kwargs.get("timeout") is None
+
+
+# ---------------------------------------------------------------------------
+# Tests: record_verified_outcome
+# ---------------------------------------------------------------------------
+
+
+class TestRecordVerifiedOutcome:
+    """record_verified_outcome writes to docs/MEMORY.md relative to CWD.
+
+    All tests use ``monkeypatch.chdir(tmp_path)`` so the default
+    ``"docs/MEMORY.md"`` path resolves inside the temp directory.
+    The real ``docs/MEMORY.md`` in the project root is NEVER touched.
+    """
+
+    def test_valid_call_creates_memory_file(self, tmp_path, monkeypatch, capsys):
+        """A verified_success call creates docs/MEMORY.md with the expected entry."""
+        monkeypatch.chdir(tmp_path)
+
+        response = run_async(
+            mcp_server.record_verified_outcome(
+                task="Add retry logic",
+                outcome="verified_success",
+                notes="All 53 tests pass.",
+                files_touched=["orchestrator.py", "mcp_server.py"],
+            )
+        )
+
+        assert response["status"] == "OK"
+        assert "memory_path" in response
+
+        memory_file = tmp_path / "docs" / "MEMORY.md"
+        assert memory_file.exists(), "docs/MEMORY.md should have been created"
+
+        content = memory_file.read_text(encoding="utf-8")
+        assert "Add retry logic" in content
+        assert "verified_success" in content
+        assert "All 53 tests pass." in content
+        assert "`orchestrator.py`" in content
+        assert "`mcp_server.py`" in content
+
+        # No stdout output (stdout is the JSON-RPC channel in MCP stdio mode).
+        assert capsys.readouterr().out == "", "mcp_server must never write to stdout"
+
+    def test_second_call_appends_without_overwriting(self, tmp_path, monkeypatch, capsys):
+        """A second call appends a new entry without overwriting the first."""
+        monkeypatch.chdir(tmp_path)
+
+        run_async(
+            mcp_server.record_verified_outcome(
+                task="First task",
+                outcome="verified_success",
+                notes="First notes.",
+            )
+        )
+        run_async(
+            mcp_server.record_verified_outcome(
+                task="Second task",
+                outcome="verified_partial",
+                notes="Second notes.",
+            )
+        )
+
+        content = (tmp_path / "docs" / "MEMORY.md").read_text(encoding="utf-8")
+        assert "First task" in content
+        assert "First notes." in content
+        assert "Second task" in content
+        assert "Second notes." in content
+        # Both entries must be present (append-only).
+        assert content.count("## ") >= 2, "Expected at least two dated entries"
+
+        # No stdout output.
+        assert capsys.readouterr().out == ""
+
+    def test_invalid_outcome_returns_error_no_write(self, tmp_path, monkeypatch, capsys):
+        """An invalid outcome value returns ERROR and does not write anything."""
+        monkeypatch.chdir(tmp_path)
+
+        response = run_async(
+            mcp_server.record_verified_outcome(
+                task="Some task",
+                outcome="not_a_real_outcome",
+                notes="Should not be written.",
+            )
+        )
+
+        assert response["status"] == "ERROR"
+        assert "error" in response
+        assert "not_a_real_outcome" in response["error"]
+
+        # The file must NOT have been created.
+        memory_file = tmp_path / "docs" / "MEMORY.md"
+        assert not memory_file.exists(), (
+            "docs/MEMORY.md must not be created on an invalid outcome"
+        )
+
+        # No stdout output.
+        assert capsys.readouterr().out == ""
+
+    def test_no_stdout_on_any_call(self, tmp_path, monkeypatch, capsys):
+        """No stdout is produced for any call path (valid, invalid, or error)."""
+        monkeypatch.chdir(tmp_path)
+
+        # Valid call.
+        run_async(
+            mcp_server.record_verified_outcome(
+                task="Task A",
+                outcome="abandoned",
+                notes="Decided not to proceed.",
+            )
+        )
+        assert capsys.readouterr().out == ""
+
+        # Invalid outcome.
+        run_async(
+            mcp_server.record_verified_outcome(
+                task="Task B",
+                outcome="bad_outcome",
+                notes="irrelevant",
+            )
+        )
+        assert capsys.readouterr().out == ""
