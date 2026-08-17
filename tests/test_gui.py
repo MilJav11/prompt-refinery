@@ -1,12 +1,48 @@
-"""Unit and smoke tests for gui.py (Streamlit GUI helpers and module structure)."""
+"""Unit and smoke tests for gui.py (Streamlit GUI helpers and module structure),
+and model_discovery.py (dynamic /v1/models fetching).
 
-from unittest.mock import AsyncMock, patch
+No real network calls are made; all HTTP interactions are mocked at the
+``urllib.request.urlopen`` level.  No secrets or API keys appear here.
+"""
+
+from __future__ import annotations
+
+import json
+from io import BytesIO
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 import gui
+import model_discovery
 import orchestrator
 from orchestrator import RunResult
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def _make_http_response(body: bytes, status: int = 200):
+    """Build a fake urllib response object for use with ``urlopen`` mocks."""
+    resp = MagicMock()
+    resp.status = status
+    resp.read.return_value = body
+    resp.__enter__ = lambda s: s
+    resp.__exit__ = MagicMock(return_value=False)
+    return resp
+
+
+def _models_payload(model_ids: list[str]) -> bytes:
+    """Return a bytes-encoded OpenAI-compatible /v1/models response."""
+    return json.dumps({"data": [{"id": m} for m in model_ids]}).encode()
+
+
+# ---------------------------------------------------------------------------
+# Existing tests (unchanged behaviour)
+# ---------------------------------------------------------------------------
 
 
 class TestGuiModelOverrideParser:
@@ -75,3 +111,263 @@ class TestGuiPipelineRunner:
             architect_model="custom-arch",
             referee_model="custom-ref",
         )
+
+
+# ---------------------------------------------------------------------------
+# URL Normalisation
+# ---------------------------------------------------------------------------
+
+
+class TestBuildModelsUrl:
+    """Tests for model_discovery._build_models_url URL normalisation."""
+
+    def test_base_ending_with_v1_appends_models(self):
+        assert model_discovery._build_models_url("http://localhost:20128/v1") == \
+            "http://localhost:20128/v1/models"
+
+    def test_base_ending_with_v1_slash_appends_models(self):
+        """Trailing slash on /v1 is stripped before suffix is appended."""
+        assert model_discovery._build_models_url("http://localhost:20128/v1/") == \
+            "http://localhost:20128/v1/models"
+
+    def test_base_without_v1_appends_v1_models(self):
+        assert model_discovery._build_models_url("http://localhost:20128") == \
+            "http://localhost:20128/v1/models"
+
+    def test_base_with_trailing_slash_without_v1(self):
+        assert model_discovery._build_models_url("http://localhost:20128/") == \
+            "http://localhost:20128/v1/models"
+
+    def test_openai_base_with_v1(self):
+        assert model_discovery._build_models_url("https://api.openai.com/v1") == \
+            "https://api.openai.com/v1/models"
+
+    def test_no_double_v1_in_path(self):
+        """The critical bug-prevention check: /v1/v1/models must never appear."""
+        url = model_discovery._build_models_url("http://localhost:20128/v1")
+        assert "/v1/v1/" not in url
+
+    def test_whitespace_stripped(self):
+        result = model_discovery._build_models_url("  http://localhost:20128/v1  ")
+        assert result == "http://localhost:20128/v1/models"
+
+
+# ---------------------------------------------------------------------------
+# fetch_available_models
+# ---------------------------------------------------------------------------
+
+
+class TestFetchAvailableModels:
+    """Tests for model_discovery.fetch_available_models.
+
+    All HTTP interactions are mocked; no real network calls are made.
+    Synthetic model IDs are used throughout — no real secrets or API keys.
+    """
+
+    def test_successful_fetch_returns_model_ids(self):
+        """A 200 response with a valid payload returns the exact model IDs."""
+        ids = ["auto/coding:free", "auto/best-free", "auto/coding", "auto/best"]
+        fake_resp = _make_http_response(_models_payload(ids))
+
+        with patch("urllib.request.urlopen", return_value=fake_resp):
+            result = model_discovery.fetch_available_models(
+                api_base="http://localhost:20128/v1",
+                api_key="dummy-key-not-real",
+            )
+
+        assert result == ids
+
+    def test_combo_ids_preserved_exactly(self):
+        """Model IDs with slashes and colons (OmniRoute combo IDs) are not altered."""
+        ids = ["auto/coding:free", "some-provider/some-model:variant"]
+        fake_resp = _make_http_response(_models_payload(ids))
+
+        with patch("urllib.request.urlopen", return_value=fake_resp):
+            result = model_discovery.fetch_available_models(
+                api_base="http://localhost:20128/v1",
+                api_key=None,
+            )
+
+        assert result == ids
+
+    def test_timeout_returns_empty_list(self):
+        """A TimeoutError is caught and returns []."""
+        with patch("urllib.request.urlopen", side_effect=TimeoutError("timed out")):
+            result = model_discovery.fetch_available_models(
+                api_base="http://localhost:20128/v1",
+                api_key=None,
+            )
+
+        assert result == []
+
+    def test_connection_error_returns_empty_list(self):
+        """A URLError (connection refused / DNS failure) returns []."""
+        import urllib.error
+
+        with patch(
+            "urllib.request.urlopen",
+            side_effect=urllib.error.URLError("Connection refused"),
+        ):
+            result = model_discovery.fetch_available_models(
+                api_base="http://localhost:20128/v1",
+                api_key=None,
+            )
+
+        assert result == []
+
+    def test_non_200_response_returns_empty_list(self):
+        """A non-200 HTTP status code returns []."""
+        fake_resp = _make_http_response(b"{}", status=503)
+
+        with patch("urllib.request.urlopen", return_value=fake_resp):
+            result = model_discovery.fetch_available_models(
+                api_base="http://localhost:20128/v1",
+                api_key=None,
+            )
+
+        assert result == []
+
+    def test_malformed_json_returns_empty_list(self):
+        """Malformed JSON in the response body returns []."""
+        fake_resp = _make_http_response(b"not-json{{{", status=200)
+
+        with patch("urllib.request.urlopen", return_value=fake_resp):
+            result = model_discovery.fetch_available_models(
+                api_base="http://localhost:20128/v1",
+                api_key=None,
+            )
+
+        assert result == []
+
+    def test_missing_data_key_returns_empty_list(self):
+        """A valid JSON response without a 'data' key returns []."""
+        fake_resp = _make_http_response(
+            json.dumps({"object": "list", "models": []}).encode(), status=200
+        )
+
+        with patch("urllib.request.urlopen", return_value=fake_resp):
+            result = model_discovery.fetch_available_models(
+                api_base="http://localhost:20128/v1",
+                api_key=None,
+            )
+
+        assert result == []
+
+    def test_data_not_a_list_returns_empty_list(self):
+        """If 'data' is not a list (e.g. a dict), returns []."""
+        fake_resp = _make_http_response(
+            json.dumps({"data": {"id": "some-model"}}).encode(), status=200
+        )
+
+        with patch("urllib.request.urlopen", return_value=fake_resp):
+            result = model_discovery.fetch_available_models(
+                api_base="http://localhost:20128/v1",
+                api_key=None,
+            )
+
+        assert result == []
+
+    def test_empty_api_base_returns_empty_list_without_network_call(self):
+        """A None or empty api_base short-circuits before any network call."""
+        with patch("urllib.request.urlopen") as mock_open:
+            result_none = model_discovery.fetch_available_models(api_base=None)
+            result_empty = model_discovery.fetch_available_models(api_base="")
+            result_blank = model_discovery.fetch_available_models(api_base="   ")
+
+        mock_open.assert_not_called()
+        assert result_none == []
+        assert result_empty == []
+        assert result_blank == []
+
+    def test_http_error_returns_empty_list(self):
+        """An HTTPError (e.g. 401 Unauthorized) returns []."""
+        import urllib.error
+
+        with patch(
+            "urllib.request.urlopen",
+            side_effect=urllib.error.HTTPError(
+                url="http://localhost:20128/v1/models",
+                code=401,
+                msg="Unauthorized",
+                hdrs=None,
+                fp=None,
+            ),
+        ):
+            result = model_discovery.fetch_available_models(
+                api_base="http://localhost:20128/v1",
+                api_key=None,
+            )
+
+        assert result == []
+
+    def test_no_api_key_in_error_propagation(self):
+        """Confirm the function never raises (defensive contract) even under OS errors."""
+        with patch("urllib.request.urlopen", side_effect=OSError("socket error")):
+            # Must not raise regardless of input
+            result = model_discovery.fetch_available_models(
+                api_base="http://localhost:20128/v1",
+                api_key="dummy-secret-not-real",
+            )
+        assert result == []
+
+    def test_proxy_url_normalization_used_in_real_call(self):
+        """Confirm the /v1 normalization actually controls the URL that urlopen receives."""
+        ids = ["auto/coding:free"]
+        fake_resp = _make_http_response(_models_payload(ids))
+
+        with patch("urllib.request.urlopen", return_value=fake_resp) as mock_open:
+            model_discovery.fetch_available_models(
+                api_base="http://localhost:20128/v1",
+                api_key=None,
+            )
+
+        # Extract the URL from the Request object passed to urlopen
+        called_req = mock_open.call_args[0][0]
+        assert called_req.full_url == "http://localhost:20128/v1/models"
+        assert "/v1/v1/" not in called_req.full_url
+
+
+# ---------------------------------------------------------------------------
+# GUI logic: preset model availability check
+# ---------------------------------------------------------------------------
+
+
+class TestPresetModelAvailabilityCheck:
+    """Tests for gui.is_model_absent_from_list.
+
+    This exercises the logic gate used by the GUI to show 'model unavailable'
+    warnings, without requiring any Streamlit rendering.
+    """
+
+    def test_model_present_in_list_returns_false(self):
+        assert gui.is_model_absent_from_list(
+            "auto/coding:free", ["auto/coding:free", "auto/best-free"]
+        ) is False
+
+    def test_model_absent_from_list_returns_true(self):
+        assert gui.is_model_absent_from_list(
+            "some-old-model", ["auto/coding:free", "auto/best-free"]
+        ) is True
+
+    def test_none_model_id_returns_false(self):
+        """No warning when there is no model ID to check."""
+        assert gui.is_model_absent_from_list(None, ["auto/coding:free"]) is False
+
+    def test_empty_model_id_returns_false(self):
+        assert gui.is_model_absent_from_list("", ["auto/coding:free"]) is False
+
+    def test_empty_available_list_returns_false(self):
+        """Suppress warnings when proxy is unreachable (empty list = offline mode)."""
+        assert gui.is_model_absent_from_list("some-model", []) is False
+
+    def test_combo_id_exact_match(self):
+        """OmniRoute combo IDs must match exactly — no partial or fuzzy matching."""
+        assert gui.is_model_absent_from_list(
+            "auto/coding:free", ["auto/coding"]
+        ) is True  # :free suffix makes it different
+
+    def test_case_sensitive_match(self):
+        """Model ID matching is case-sensitive."""
+        assert gui.is_model_absent_from_list(
+            "Auto/Coding:Free", ["auto/coding:free"]
+        ) is True

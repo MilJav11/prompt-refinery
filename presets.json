@@ -1,0 +1,23 @@
+{
+  "coding-fast": {
+    "architect": "auto/coding:free",
+    "referee": "auto/best-free",
+    "description": "OmniRoute — fast free coding combo",
+    "last_reviewed": "2026-08-11",
+    "notes": "Uses OmniRoute auto-routing aliases. OmniRoute selects the best available free coding model at request time. Re-check against SWE-bench/LiveCodeBench leaderboards periodically to ensure OmniRoute's free-tier routing still targets competitive models."
+  },
+  "coding-quality": {
+    "architect": "auto/coding",
+    "referee": "auto/best",
+    "description": "OmniRoute — higher-quality (non-free) coding combo",
+    "last_reviewed": "2026-08-11",
+    "notes": "Uses OmniRoute's non-free routing aliases for higher-quality inference. Costs more than coding-fast. Re-verify OmniRoute routing table every 4-6 weeks."
+  },
+  "budget": {
+    "architect": "auto/coding:free",
+    "referee": "auto/coding:free",
+    "description": "OmniRoute — cheapest meaningful combination (free tier only)",
+    "last_reviewed": "2026-08-11",
+    "notes": "Both roles use the free-tier coding alias. Lowest cost; quality tradeoff expected on complex tasks. OmniRoute selects the best free model dynamically."
+  }
+}

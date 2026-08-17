@@ -207,6 +207,114 @@ Model presets are convenience shortcuts that select a pre-defined Architect/Refe
 
 ---
 
+### External Presets (`presets.json`)
+
+In addition to the built-in presets above, you can define your own presets in a **`presets.json`** file at the project root. External presets are loaded automatically at startup and merged with the built-ins — external entries take precedence if they share a key name with a built-in.
+
+#### Schema
+
+Every entry in `presets.json` **must** contain all five keys:
+
+```json
+{
+  "my-preset": {
+    "architect": "auto/coding:free",
+    "referee": "auto/best-free",
+    "description": "Short human-readable description shown in the GUI",
+    "last_reviewed": "2026-08-11",
+    "notes": "Why this combo was chosen and when it should be revisited."
+  }
+}
+```
+
+| Key | Type | Required | Notes |
+|-----|------|----------|-------|
+| `architect` | string | ✅ | LiteLLM-compatible model ID for the Architect stage |
+| `referee` | string | ✅ | LiteLLM-compatible model ID for the Referee stage |
+| `description` | string | ✅ | One-line description shown in the GUI preset selector |
+| `last_reviewed` | string (ISO date) | ✅ | Date the preset was last validated against current model availability |
+| `notes` | string | ✅ | Rationale for the choice and any caveats |
+
+Any entry **missing** `last_reviewed` or `notes` is **skipped** with a warning log message. This is intentional: the LLM landscape changes monthly, and every preset that reaches production must have a paper trail of when it was last verified.
+
+#### Adding / Editing / Removing Presets
+
+- **Add**: Append a new JSON object to `presets.json` following the schema above.
+- **Edit**: Update the relevant fields and **update `last_reviewed` to today's date**.
+- **Remove**: Delete the entry. The built-in presets remain unaffected.
+- **Override a built-in**: Use the same key as a built-in preset (e.g. `"budget"`) — the external entry will replace it completely.
+
+#### Staleness Safeguard
+
+A preset is considered **stale** when today's date is more than **60 days** after its `last_reviewed` date. Stale presets cause:
+
+- A **visible warning** in the Streamlit GUI sidebar prompting you to re-verify the model IDs.
+- The `config.get_preset_staleness_days(preset_name)` helper returns the exact age in days, which can be used in automation scripts or CI checks.
+
+The 60-day threshold exists because model availability, routing aliases, and performance rankings change frequently — a preset that was optimal in June may route to a deprecated or downgraded model by September.
+
+#### Why `last_reviewed` and `notes` Are Mandatory
+
+The LLM landscape evolves rapidly: models are deprecated, renamed, repriced, or outperformed within weeks. Requiring `last_reviewed` and `notes` on every preset creates a lightweight audit trail that:
+
+1. Forces the author to document *why* a model pair was chosen.
+2. Makes it easy to spot presets that haven't been revisited recently.
+3. Supports automated staleness checks in CI without any network calls.
+
+#### Preset Maintenance
+
+> **Recommended cadence: every 4–6 weeks.**
+
+Before trusting a preset in production, verify the model IDs against current benchmarks and provider model lists:
+
+- **SWE-bench** (coding task evaluation): <https://www.swebench.com>
+- **LiveCodeBench** (live programming contests): <https://livecodebench.github.io>
+- Your proxy's `/v1/models` endpoint (the GUI does this automatically)
+
+After reviewing, update `last_reviewed` to today's date and revise `notes` to reflect any changes in the model landscape.
+
+---
+
+### Dynamic Model Discovery (Streamlit GUI)
+
+The Streamlit GUI (`streamlit run gui.py`) automatically fetches the list of available models from the configured proxy endpoint on startup:
+
+```
+GET {VCF_API_BASE}/models        # when VCF_API_BASE ends with /v1
+GET {VCF_API_BASE}/v1/models     # otherwise
+```
+
+This is the same endpoint that OmniRoute (and any other OpenAI-compatible proxy) exposes. The response model IDs are displayed **exactly as returned** — no renaming, no filtering.
+
+#### URL Normalisation
+
+The GUI normalises the base URL to prevent the `/v1/v1/models` double-path bug:
+
+| `VCF_API_BASE` | Endpoint queried |
+|---|---|
+| `http://localhost:20128/v1` | `http://localhost:20128/v1/models` ✅ |
+| `http://localhost:20128` | `http://localhost:20128/v1/models` ✅ |
+| `http://localhost:20128/v1/` | `http://localhost:20128/v1/models` ✅ |
+
+#### Timeout and Fallback
+
+- The fetch uses a **3-second timeout**. If the proxy does not respond within that window, the GUI falls back to **manual text-input fields** — the same inputs that existed before this feature was added.
+- Any error (timeout, connection refused, non-200 status, malformed JSON) silently returns an empty model list and activates fallback mode.
+- The API key is sent in the `Authorization: Bearer` header but is **never logged, printed, or written to any file**.
+
+#### Staleness and Unavailability Warnings
+
+| Condition | GUI behaviour |
+|-----------|--------------|
+| Selected preset was last reviewed > 60 days ago | Orange `⏰` warning in sidebar |
+| Preset's model ID not in the fetched proxy list | Inline `⚠️` warning next to the model field |
+| Proxy unreachable / timeout | `⚠️ Proxy unavailable — manual model entry mode` status badge |
+| Proxy reachable | `✅ N models loaded from proxy` status badge |
+
+The **model unavailability warning** means the proxy you are connected to does not currently advertise that model ID. This does not guarantee the call will fail (the proxy might still route it), but it is a signal that the preset may be stale or misconfigured.
+
+---
+
 ## CLI Usage
 
 ### Basic Invocation

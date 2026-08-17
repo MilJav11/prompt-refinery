@@ -1274,7 +1274,16 @@ class TestResolveModels:
     """Unit tests for ``config.resolve_models`` — pure resolution logic, no I/O."""
 
     def test_budget_preset_resolves_both_models(self, monkeypatch):
-        """'budget' preset resolves both Architect and Referee to Gemini Flash Lite."""
+        """Built-in 'budget' preset resolves both roles to Gemini Flash Lite.
+
+        Monkeypatches MODEL_PRESETS to the built-in value so this test is
+        isolated from any external presets.json that may override 'budget'.
+        """
+        monkeypatch.setitem(
+            config.MODEL_PRESETS,
+            "budget",
+            config._BUILTIN_PRESETS["budget"],
+        )
         arch, ref = config.resolve_models(preset="budget")
         assert arch == "openrouter/google/gemini-2.5-flash-lite"
         assert ref == "openrouter/google/gemini-2.5-flash-lite"
@@ -1300,21 +1309,37 @@ class TestResolveModels:
         assert ref == "claude-3-5-sonnet"
 
     def test_explicit_architect_override_beats_preset(self, monkeypatch):
-        """Explicit architect_model wins over the preset value; referee comes from preset."""
+        """Explicit architect_model wins over the preset; referee comes from built-in preset.
+
+        Monkeypatches MODEL_PRESETS to isolate from external presets.json.
+        """
+        monkeypatch.setitem(
+            config.MODEL_PRESETS,
+            "budget",
+            config._BUILTIN_PRESETS["budget"],
+        )
         arch, ref = config.resolve_models(
             preset="budget",
             architect_model="my-custom-architect",
         )
         assert arch == "my-custom-architect"
-        assert ref == "openrouter/google/gemini-2.5-flash-lite"  # from budget preset
+        assert ref == "openrouter/google/gemini-2.5-flash-lite"  # from built-in budget preset
 
     def test_explicit_referee_override_beats_preset(self, monkeypatch):
-        """Explicit referee_model wins over the preset value; architect comes from preset."""
+        """Explicit referee_model wins over the preset; architect comes from built-in preset.
+
+        Monkeypatches MODEL_PRESETS to isolate from external presets.json.
+        """
+        monkeypatch.setitem(
+            config.MODEL_PRESETS,
+            "budget",
+            config._BUILTIN_PRESETS["budget"],
+        )
         arch, ref = config.resolve_models(
             preset="budget",
             referee_model="my-custom-referee",
         )
-        assert arch == "openrouter/google/gemini-2.5-flash-lite"  # from budget preset
+        assert arch == "openrouter/google/gemini-2.5-flash-lite"  # from built-in budget preset
         assert ref == "my-custom-referee"
 
     def test_both_explicit_overrides_beat_preset(self, monkeypatch):
@@ -1389,8 +1414,17 @@ class TestPresetInPipeline:
         assert (zed_dir / "review.md").exists()
 
     def test_valid_preset_passes_correct_models_to_litellm(self, tmp_path, monkeypatch):
-        """A valid preset ('budget') is resolved and its model IDs reach LiteLLM."""
+        """A valid preset ('budget') is resolved and its model IDs reach LiteLLM.
+
+        Monkeypatches MODEL_PRESETS to the built-in budget value so this test
+        is isolated from any external presets.json present in the project root.
+        """
         expected_arch = "openrouter/google/gemini-2.5-flash-lite"
+        monkeypatch.setitem(
+            config.MODEL_PRESETS,
+            "budget",
+            config._BUILTIN_PRESETS["budget"],
+        )
         expected_prompt = compliant_prompt("via budget preset")
         mock = AsyncMock(
             side_effect=[
@@ -1409,7 +1443,7 @@ class TestPresetInPipeline:
         )
 
         assert result.status == "APPROVED"
-        # Both LLM calls must use the budget preset's model ID.
+        # Both LLM calls must use the built-in budget preset's model ID.
         for call in mock.await_args_list:
             assert call.kwargs["model"] == expected_arch
 
@@ -1423,8 +1457,17 @@ class TestCliPreset:
     """CLI parsing and passthrough for --preset / -p."""
 
     def test_preset_budget_parsed_and_forwarded(self, tmp_path, monkeypatch):
-        """--preset budget is accepted and forwarded to run_pipeline."""
+        """--preset budget is accepted and forwarded to run_pipeline.
+
+        Monkeypatches MODEL_PRESETS to the built-in budget value so this test
+        is isolated from any external presets.json present in the project root.
+        """
         monkeypatch.chdir(tmp_path)
+        monkeypatch.setitem(
+            config.MODEL_PRESETS,
+            "budget",
+            config._BUILTIN_PRESETS["budget"],
+        )
         expected_prompt = compliant_prompt("budget run")
         mock = AsyncMock(
             side_effect=[
@@ -1437,13 +1480,21 @@ class TestCliPreset:
         exit_code = vcf.main(["some task", "--preset", "budget"])
 
         assert exit_code == 0
-        # Both calls must have used the budget model.
+        # Both calls must have used the built-in budget model.
         for call in mock.await_args_list:
             assert call.kwargs["model"] == "openrouter/google/gemini-2.5-flash-lite"
 
     def test_explicit_architect_model_overrides_preset(self, tmp_path, monkeypatch):
-        """--architect-model overrides --preset for the architect field only."""
+        """--architect-model overrides --preset for the architect field only.
+
+        Monkeypatches MODEL_PRESETS to the built-in budget value for isolation.
+        """
         monkeypatch.chdir(tmp_path)
+        monkeypatch.setitem(
+            config.MODEL_PRESETS,
+            "budget",
+            config._BUILTIN_PRESETS["budget"],
+        )
         expected_prompt = compliant_prompt("override test")
         mock = AsyncMock(
             side_effect=[
@@ -1461,7 +1512,7 @@ class TestCliPreset:
         calls = mock.await_args_list
         # First call is architect (my-custom-model wins over budget preset).
         assert calls[0].kwargs["model"] == "my-custom-model"
-        # Second call is referee (budget preset's referee, no override given).
+        # Second call is referee (built-in budget preset's referee, no override given).
         assert calls[1].kwargs["model"] == "openrouter/google/gemini-2.5-flash-lite"
 
     def test_short_flag_p_accepted(self, tmp_path, monkeypatch):
@@ -1479,3 +1530,226 @@ class TestCliPreset:
         exit_code = vcf.main(["some task", "-p", "balanced"])
 
         assert exit_code == 0
+
+
+# ---------------------------------------------------------------------------
+# External Presets (presets.json) — config.py integration tests
+# ---------------------------------------------------------------------------
+
+
+class TestExternalPresets:
+    """Tests for dynamic presets.json loading, validation, and staleness helper."""
+
+    # ------------------------------------------------------------------
+    # Helper: build a minimal valid presets.json dict
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _valid_entry(
+        architect: str = "auto/coding:free",
+        referee: str = "auto/best-free",
+        last_reviewed: str = "2026-08-11",
+    ) -> dict:
+        return {
+            "architect": architect,
+            "referee": referee,
+            "description": "Test preset",
+            "last_reviewed": last_reviewed,
+            "notes": "Unit-test synthetic preset.",
+        }
+
+    # ------------------------------------------------------------------
+    # Loading / validation
+    # ------------------------------------------------------------------
+
+    def test_valid_presets_json_loaded(self, tmp_path):
+        """A well-formed presets.json with all required fields is loaded correctly."""
+        presets_file = tmp_path / "presets.json"
+        presets_file.write_text(
+            json.dumps(
+                {
+                    "test-fast": self._valid_entry(
+                        architect="auto/coding:free",
+                        referee="auto/best-free",
+                    )
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        tuples, metadata = config._load_external_presets(presets_path=presets_file)
+
+        assert "test-fast" in tuples
+        assert tuples["test-fast"] == ("auto/coding:free", "auto/best-free")
+        assert metadata["test-fast"]["last_reviewed"] == "2026-08-11"
+        assert metadata["test-fast"]["notes"] == "Unit-test synthetic preset."
+
+    def test_missing_presets_json_returns_empty_dicts(self, tmp_path):
+        """If presets.json does not exist, both returned dicts are empty."""
+        missing = tmp_path / "nonexistent.json"
+        tuples, metadata = config._load_external_presets(presets_path=missing)
+        assert tuples == {}
+        assert metadata == {}
+
+    def test_missing_presets_json_leaves_builtin_presets_intact(self, tmp_path):
+        """Built-in presets remain available when presets.json is absent."""
+        missing = tmp_path / "nonexistent.json"
+        # Reload config with an absent path — simulate what happens at module level.
+        ext_tuples, _ = config._load_external_presets(presets_path=missing)
+        merged = {**config._BUILTIN_PRESETS, **ext_tuples}
+        assert "balanced" in merged
+        assert "budget" in merged
+
+    def test_malformed_json_returns_empty_dicts(self, tmp_path):
+        """Malformed presets.json returns empty dicts without crashing."""
+        presets_file = tmp_path / "presets.json"
+        presets_file.write_text("{not valid json", encoding="utf-8")
+
+        tuples, metadata = config._load_external_presets(presets_path=presets_file)
+
+        assert tuples == {}
+        assert metadata == {}
+
+    def test_non_object_json_returns_empty_dicts(self, tmp_path):
+        """A JSON array at the top level is rejected gracefully."""
+        presets_file = tmp_path / "presets.json"
+        presets_file.write_text("[1, 2, 3]", encoding="utf-8")
+
+        tuples, metadata = config._load_external_presets(presets_path=presets_file)
+
+        assert tuples == {}
+        assert metadata == {}
+
+    def test_entry_missing_last_reviewed_is_skipped(self, tmp_path):
+        """An entry without 'last_reviewed' is skipped; other valid entries still load."""
+        entry = self._valid_entry()
+        del entry["last_reviewed"]
+
+        presets_file = tmp_path / "presets.json"
+        presets_file.write_text(
+            json.dumps({"bad-entry": entry, "good-entry": self._valid_entry()}),
+            encoding="utf-8",
+        )
+
+        tuples, _ = config._load_external_presets(presets_path=presets_file)
+
+        assert "bad-entry" not in tuples
+        assert "good-entry" in tuples
+
+    def test_entry_missing_notes_is_skipped(self, tmp_path):
+        """An entry without 'notes' is skipped."""
+        entry = self._valid_entry()
+        del entry["notes"]
+
+        presets_file = tmp_path / "presets.json"
+        presets_file.write_text(json.dumps({"bad-entry": entry}), encoding="utf-8")
+
+        tuples, _ = config._load_external_presets(presets_path=presets_file)
+
+        assert "bad-entry" not in tuples
+
+    def test_entry_invalid_last_reviewed_date_is_skipped(self, tmp_path):
+        """An entry with a non-ISO last_reviewed string is skipped."""
+        entry = self._valid_entry()
+        entry["last_reviewed"] = "not-a-date"
+
+        presets_file = tmp_path / "presets.json"
+        presets_file.write_text(json.dumps({"bad-date": entry}), encoding="utf-8")
+
+        tuples, _ = config._load_external_presets(presets_path=presets_file)
+
+        assert "bad-date" not in tuples
+
+    def test_entry_empty_architect_is_skipped(self, tmp_path):
+        """An entry with an empty 'architect' string is skipped."""
+        entry = self._valid_entry(architect="   ")
+
+        presets_file = tmp_path / "presets.json"
+        presets_file.write_text(json.dumps({"empty-arch": entry}), encoding="utf-8")
+
+        tuples, _ = config._load_external_presets(presets_path=presets_file)
+
+        assert "empty-arch" not in tuples
+
+    def test_external_preset_overrides_builtin_same_key(self, tmp_path):
+        """External presets replace built-in presets with the same key name."""
+        entry = self._valid_entry(architect="auto/coding:free", referee="auto/best-free")
+
+        presets_file = tmp_path / "presets.json"
+        presets_file.write_text(json.dumps({"budget": entry}), encoding="utf-8")
+
+        ext_tuples, _ = config._load_external_presets(presets_path=presets_file)
+        merged = {**config._BUILTIN_PRESETS, **ext_tuples}
+
+        assert merged["budget"] == ("auto/coding:free", "auto/best-free")
+
+    def test_combo_ids_preserved_exactly(self, tmp_path):
+        """Model IDs containing slashes and colons are stored without alteration."""
+        combo_id = "auto/coding:free"
+        entry = self._valid_entry(architect=combo_id, referee="auto/best-free")
+
+        presets_file = tmp_path / "presets.json"
+        presets_file.write_text(json.dumps({"combo-test": entry}), encoding="utf-8")
+
+        tuples, _ = config._load_external_presets(presets_path=presets_file)
+
+        assert tuples["combo-test"][0] == combo_id
+
+    # ------------------------------------------------------------------
+    # Staleness helper
+    # ------------------------------------------------------------------
+
+    def test_get_preset_staleness_days_correct(self, tmp_path, monkeypatch):
+        """get_preset_staleness_days returns the correct day count."""
+        from datetime import date as _date
+
+        # Inject a fresh entry directly into PRESET_METADATA for isolation.
+        monkeypatch.setitem(
+            config.PRESET_METADATA,
+            "staleness-test",
+            {"last_reviewed": "2026-06-01", "description": "", "notes": ""},
+        )
+
+        # Mock today to a known date 70 days after last_reviewed.
+        fixed_today = _date(2026, 8, 10)
+        monkeypatch.setattr(config, "date", type("_FakeDate", (), {"today": staticmethod(lambda: fixed_today)}))
+
+        days = config.get_preset_staleness_days("staleness-test")
+
+        assert days == 70
+
+    def test_get_preset_staleness_days_unknown_preset_returns_none(self):
+        """get_preset_staleness_days returns None for an unknown preset name."""
+        assert config.get_preset_staleness_days("definitely-not-a-real-preset") is None
+
+    def test_get_preset_staleness_days_none_last_reviewed_returns_none(self, monkeypatch):
+        """get_preset_staleness_days returns None when last_reviewed is None."""
+        monkeypatch.setitem(
+            config.PRESET_METADATA,
+            "no-date-preset",
+            {"last_reviewed": None, "description": "", "notes": ""},
+        )
+        assert config.get_preset_staleness_days("no-date-preset") is None
+
+    # ------------------------------------------------------------------
+    # Backward compatibility: resolve_models still works with merged presets
+    # ------------------------------------------------------------------
+
+    def test_builtin_presets_resolve_models_unchanged(self, monkeypatch):
+        """Existing built-in preset resolution is unaffected by external presets."""
+        monkeypatch.setattr(config, "ARCHITECT_MODEL", "env-arch")
+        monkeypatch.setattr(config, "REFEREE_MODEL", "env-ref")
+
+        arch, ref = config.resolve_models(preset="balanced")
+        assert arch == "env-arch"
+        assert ref == "env-ref"
+
+    def test_external_preset_resolves_via_resolve_models(self, tmp_path, monkeypatch):
+        """An external preset loaded into MODEL_PRESETS resolves correctly."""
+        monkeypatch.setitem(
+            config.MODEL_PRESETS,
+            "injected-preset",
+            ("auto/coding:free", "auto/best-free"),
+        )
+        arch, ref = config.resolve_models(preset="injected-preset")
+        assert arch == "auto/coding:free"
+        assert ref == "auto/best-free"

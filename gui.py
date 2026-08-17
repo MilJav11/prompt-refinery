@@ -10,8 +10,12 @@ import asyncio
 import streamlit as st
 
 import config
+import model_discovery
 import orchestrator
 from orchestrator import RunResult
+
+# Sentinel shown in the model selectbox to let users type a custom ID.
+_CUSTOM_MODEL_OPTION = "[Custom / Manual entry]"
 
 
 def parse_model_override(value: str | None) -> str | None:
@@ -53,6 +57,115 @@ def run_pipeline_sync(
     )
 
 
+def is_model_absent_from_list(model_id: str | None, available: list[str]) -> bool:
+    """Return True when ``model_id`` is non-empty but absent from ``available``.
+
+    This is the logic gate used by the GUI to decide whether to show an
+    "unavailable" warning — extracted as a plain function so it can be
+    unit-tested without Streamlit rendering.
+
+    Parameters
+    ----------
+    model_id:
+        The model ID the preset (or override) wants to use.  ``None`` or
+        empty string always returns ``False`` (no warning).
+    available:
+        The list of model IDs returned by the proxy.  An *empty* list means
+        the proxy was unreachable, so warnings are suppressed.
+    """
+    if not model_id or not available:
+        return False
+    return model_id not in available
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def _fetch_models_cached(api_base: str | None, api_key: str | None) -> list[str]:
+    """Cached wrapper for :func:`model_discovery.fetch_available_models`.
+
+    TTL of 60 seconds prevents repeated proxy hits on every Streamlit rerun.
+    The API key is accepted as a parameter (so the cache key includes it)
+    but is never surfaced in logs or error messages.
+    """
+    return model_discovery.fetch_available_models(api_base=api_base, api_key=api_key)
+
+
+def _render_model_field(
+    label: str,
+    field_key: str,
+    preset_model: str,
+    available_models: list[str],
+) -> str | None:
+    """Render Architect or Referee model selection in the sidebar.
+
+    If the proxy returned a model list, shows a selectbox populated with
+    those IDs plus a ``[Custom / Manual entry]`` option.  Selecting the
+    custom option reveals a fallback ``st.text_input``.
+
+    If the proxy is unreachable (``available_models`` is empty), falls back
+    to a plain ``st.text_input`` so the GUI stays fully usable offline.
+
+    Returns the resolved model override string (or ``None`` if the user
+    left the field blank / chose the preset default).
+    """
+    if available_models:
+        # Build the dropdown options: proxy model list + custom entry option.
+        options = available_models + [_CUSTOM_MODEL_OPTION]
+
+        # Pre-select the preset's model if it is in the list; otherwise
+        # default to [Custom / Manual entry] so the mismatch is visible.
+        if preset_model in available_models:
+            default_idx = available_models.index(preset_model)
+        else:
+            default_idx = len(options) - 1  # [Custom / Manual entry]
+
+        selected = st.selectbox(
+            label,
+            options=options,
+            index=default_idx,
+            key=f"selectbox_{field_key}",
+            help=(
+                "Select a model ID returned by the configured proxy, or choose "
+                f"'{_CUSTOM_MODEL_OPTION}' to type any LiteLLM-compatible model ID."
+            ),
+        )
+
+        if selected == _CUSTOM_MODEL_OPTION:
+            raw = st.text_input(
+                f"{label} (custom ID)",
+                value="",
+                key=f"text_{field_key}",
+                help="Type any LiteLLM-compatible model ID (e.g. auto/coding:free).",
+            )
+            return parse_model_override(raw)
+
+        # Warn if the preset's configured model is absent from the proxy list.
+        if is_model_absent_from_list(preset_model, available_models):
+            st.warning(
+                f"⚠️ The preset model **{preset_model}** is not in the current "
+                "proxy model list. It may have been removed or renamed. "
+                "Select a different model or check your proxy configuration.",
+                icon="⚠️",
+            )
+
+        # Return None when the user selected the preset-default model
+        # (let resolve_models() apply the preset normally).
+        if selected == preset_model:
+            return None
+        return selected
+
+    # Fallback: proxy unreachable — plain text input.
+    raw = st.text_input(
+        label,
+        value="",
+        key=f"text_{field_key}",
+        help=(
+            "Override model ID (e.g. auto/coding:free). "
+            "Leave blank to use preset default."
+        ),
+    )
+    return parse_model_override(raw)
+
+
 def render_app() -> None:
     """Render the Streamlit user interface."""
     st.set_page_config(page_title="Prompt Refinery (VCF)", layout="wide", page_icon="⚡")
@@ -60,29 +173,93 @@ def render_app() -> None:
     # --- Sidebar / Controls ---
     st.sidebar.header("⚙️ Configuration")
 
-    presets = list(config.MODEL_PRESETS.keys())
-    default_index = presets.index("balanced") if "balanced" in presets else 0
-    selected_preset = st.sidebar.selectbox(
+    # ------------------------------------------------------------------ #
+    # Fetch available models from proxy (cached, 60 s TTL).              #
+    # Uses the same api_base / api_key that VCF uses for actual runs,    #
+    # so the model list reflects exactly what the proxy can serve.       #
+    # ------------------------------------------------------------------ #
+    available_models: list[str] = _fetch_models_cached(
+        api_base=config.API_BASE,
+        api_key=config.AGENTROUTER_API_KEY,
+    )
+
+    if available_models:
+        st.sidebar.success(
+            f"✅ {len(available_models)} models loaded from proxy", icon="✅"
+        )
+    else:
+        st.sidebar.warning(
+            "⚠️ Proxy unavailable — manual model entry mode", icon="⚠️"
+        )
+
+    # ------------------------------------------------------------------ #
+    # Preset selector                                                      #
+    # ------------------------------------------------------------------ #
+    preset_keys = list(config.MODEL_PRESETS.keys())
+    default_index = preset_keys.index("balanced") if "balanced" in preset_keys else 0
+
+    # Build display labels: "key — description" when metadata is available.
+    def _preset_label(key: str) -> str:
+        meta = config.PRESET_METADATA.get(key, {})
+        desc = meta.get("description", "")
+        return f"{key} — {desc}" if desc else key
+
+    preset_labels = [_preset_label(k) for k in preset_keys]
+    # Inverse map: label → key
+    label_to_key = dict(zip(preset_labels, preset_keys))
+
+    selected_label = st.sidebar.selectbox(
         "Model Preset",
-        options=presets,
+        options=preset_labels,
         index=default_index,
         help="Select a model preset shortcut. Explicit overrides below take priority.",
     )
+    selected_preset = label_to_key[selected_label]
+
+    # Show preset metadata below the selector.
+    preset_meta = config.PRESET_METADATA.get(selected_preset, {})
+    last_reviewed = preset_meta.get("last_reviewed")
+    notes = preset_meta.get("notes")
+    if last_reviewed or notes:
+        caption_parts: list[str] = []
+        if last_reviewed:
+            caption_parts.append(f"**Last reviewed:** {last_reviewed}")
+        if notes:
+            caption_parts.append(notes)
+        st.sidebar.caption("  \n".join(caption_parts))
+
+    # Staleness warning (> 60 days since last_reviewed).
+    staleness = config.get_preset_staleness_days(selected_preset)
+    if staleness is not None and staleness > 60:
+        st.sidebar.warning(
+            f"⏰ This preset was last reviewed **{staleness} days ago**. "
+            "Model availability changes frequently — verify the model IDs against "
+            "current provider/proxy model lists before relying on this preset in production.",
+        )
+
+    # ------------------------------------------------------------------ #
+    # Custom Model Overrides                                               #
+    # ------------------------------------------------------------------ #
+    # Resolve what models the selected preset would use (for pre-selection).
+    preset_arch_raw, preset_ref_raw = config.MODEL_PRESETS[selected_preset]
+    from config import _BALANCED_SENTINEL, ARCHITECT_MODEL, REFEREE_MODEL  # noqa: E402
+
+    preset_arch = ARCHITECT_MODEL if preset_arch_raw == _BALANCED_SENTINEL else preset_arch_raw
+    preset_ref = REFEREE_MODEL if preset_ref_raw == _BALANCED_SENTINEL else preset_ref_raw
 
     with st.sidebar.expander("🛠️ Custom Model Overrides"):
-        arch_input = st.text_input(
-            "Architect Model",
-            value="",
-            help="Override Architect model ID (e.g. gpt-4o-mini). Leave blank to use preset default.",
+        architect_model = _render_model_field(
+            label="Architect Model",
+            field_key="architect",
+            preset_model=preset_arch,
+            available_models=available_models,
         )
-        ref_input = st.text_input(
-            "Referee Model",
-            value="",
-            help="Override Referee model ID (e.g. claude-3-5-sonnet). Leave blank to use preset default.",
+        referee_model = _render_model_field(
+            label="Referee Model",
+            field_key="referee",
+            preset_model=preset_ref,
+            available_models=available_models,
         )
-
-    architect_model = parse_model_override(arch_input)
-    referee_model = parse_model_override(ref_input)
 
     # --- Main Area ---
     st.title("⚡ Prompt Refinery (VCF)")
