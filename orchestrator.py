@@ -526,18 +526,25 @@ async def run_architect(
 
 
 async def run_referee(
+    task: str,
+    context: str,
     draft: ArchitectDraft,
     model: str,
     timeout: float,
     stage: str = "referee_review",
 ) -> tuple[RefereeReview, list[CallMetrics]]:
     """Run the Referee and return ``(review, call_metrics_list)``."""
+    project_context = context or "No project context is available."
     messages = [
         {"role": "system", "content": REFEREE_SYSTEM_PROMPT},
         {
             "role": "user",
             "content": (
-                "Review the following Architect draft (JSON):\n"
+                "Original user task:\n"
+                f"{task}\n\n"
+                "Project context:\n"
+                f"{project_context}\n\n"
+                "Architect draft (JSON):\n"
                 f"{draft.model_dump_json(indent=2)}"
             ),
         },
@@ -569,6 +576,8 @@ def _contract_violation_review(result: ContractValidationResult) -> RefereeRevie
 
 
 async def _review_with_contract_gate(
+    task: str,
+    context: str,
     draft: ArchitectDraft,
     referee_model: str,
     timeout: float,
@@ -589,7 +598,7 @@ async def _review_with_contract_gate(
     contract_result = validate_prompt_contract(draft.zed_prompt)
     if not contract_result.is_valid:
         return _contract_violation_review(contract_result), []
-    return await run_referee(draft, referee_model, timeout, stage=stage)
+    return await run_referee(task, context, draft, referee_model, timeout, stage=stage)
 
 
 _NO_FALLBACK_TEXT = (
@@ -853,7 +862,7 @@ async def run_pipeline(
         # Prompt Contract v1 structural gate: a draft that deterministically
         # fails it is rejected without spending a Referee LLM call.
         review, review1_metrics = await _review_with_contract_gate(
-            draft, referee_model, timeout, stage="referee_review_1"
+            task, context, draft, referee_model, timeout, stage="referee_review_1"
         )
         metrics.calls.extend(review1_metrics)
         diagnostic_info["reviews"].append(review.model_dump())
@@ -880,7 +889,7 @@ async def run_pipeline(
         diagnostic_info["drafts"].append(fixed_draft.model_dump())
 
         second_review, review2_metrics = await _review_with_contract_gate(
-            fixed_draft, referee_model, timeout, stage="referee_review_2"
+            task, context, fixed_draft, referee_model, timeout, stage="referee_review_2"
         )
         metrics.calls.extend(review2_metrics)
         diagnostic_info["reviews"].append(second_review.model_dump())

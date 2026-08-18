@@ -685,6 +685,82 @@ class TestPromptContractEnforcement:
         # No Referee call was needed: the contract gate rejected both drafts
         # deterministically, so only the two Architect calls happened.
         assert mock.await_count == 2
+        assert all(
+            call.kwargs["messages"][0]["content"]
+            == orchestrator.ARCHITECT_SYSTEM_PROMPT
+            for call in mock.await_args_list
+        )
+
+    def test_referee_messages_include_task_context_and_current_draft_for_both_reviews(
+        self, tmp_path, monkeypatch
+    ):
+        task = "Add an idempotent retry policy to imports"
+        context = "The importer is in src/importer.py and retries must be bounded."
+        (tmp_path / "PROJECT_CONTEXT.md").write_text(context, encoding="utf-8")
+        first_prompt = compliant_prompt("first draft needs a retry policy")
+        fixed_prompt = compliant_prompt("fixed draft adds bounded retries")
+        mock = AsyncMock(
+            side_effect=[
+                llm_response(draft_json(prompt=first_prompt)),
+                llm_response(review_json(status="REJECT", critique=["add bounds"])),
+                llm_response(draft_json(prompt=fixed_prompt)),
+                llm_response(review_json(status="APPROVED")),
+            ]
+        )
+        monkeypatch.setattr(orchestrator.litellm, "acompletion", mock)
+
+        result = run_pipeline(
+            task,
+            architect_model="fake/architect",
+            referee_model="fake/referee",
+            context_dir=tmp_path,
+            zed_dir=tmp_path / ".zed",
+        )
+
+        assert result.status == "APPROVED"
+        referee_messages = [
+            call.kwargs["messages"]
+            for call in mock.await_args_list
+            if call.kwargs["messages"][0]["content"]
+            == orchestrator.REFEREE_SYSTEM_PROMPT
+        ]
+        assert len(referee_messages) == 2
+        contents = [messages[1]["content"] for messages in referee_messages]
+        expected_prefix = f"Original user task:\n{task}\n\nProject context:\n{context}\n\n"
+        assert all(content.startswith(expected_prefix) for content in contents)
+        assert all("Architect draft (JSON):\n" in content for content in contents)
+        assert json.loads(contents[0].split("Architect draft (JSON):\n", 1)[1])["zed_prompt"] == first_prompt
+        assert json.loads(contents[1].split("Architect draft (JSON):\n", 1)[1])["zed_prompt"] == fixed_prompt
+
+    def test_referee_message_marks_empty_project_context(self, tmp_path, monkeypatch):
+        task = "Document the import process"
+        prompt = compliant_prompt("draft with no project context")
+        mock = AsyncMock(
+            side_effect=[
+                llm_response(draft_json(prompt=prompt)),
+                llm_response(review_json(status="APPROVED")),
+            ]
+        )
+        monkeypatch.setattr(orchestrator.litellm, "acompletion", mock)
+
+        result = run_pipeline(
+            task,
+            architect_model="fake/architect",
+            referee_model="fake/referee",
+            context_dir=tmp_path,
+            zed_dir=tmp_path / ".zed",
+        )
+
+        assert result.status == "APPROVED"
+        referee_call = next(
+            call for call in mock.await_args_list
+            if call.kwargs["messages"][0]["content"]
+            == orchestrator.REFEREE_SYSTEM_PROMPT
+        )
+        content = referee_call.kwargs["messages"][1]["content"]
+        assert f"Original user task:\n{task}" in content
+        assert "Project context:\nNo project context is available." in content
+        assert json.loads(content.split("Architect draft (JSON):\n", 1)[1])["zed_prompt"] == prompt
 
     def test_contract_failure_is_recorded_in_review_md(self, tmp_path, monkeypatch):
         mock = AsyncMock(
