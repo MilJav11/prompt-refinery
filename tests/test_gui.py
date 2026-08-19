@@ -14,6 +14,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+import config
 import gui
 import model_discovery
 import orchestrator
@@ -371,3 +372,159 @@ class TestPresetModelAvailabilityCheck:
         assert gui.is_model_absent_from_list(
             "Auto/Coding:Free", ["auto/coding:free"]
         ) is True
+
+
+# ---------------------------------------------------------------------------
+# GUI logic: external agent output validation
+# ---------------------------------------------------------------------------
+
+
+class TestExternalOutputValidation:
+    """Mocked tests for the independent external-output validation UI."""
+
+    @staticmethod
+    def _fake_streamlit(
+        external_task: str = " original task ", external_output: str = " agent output "
+    ):
+        fake_st = MagicMock()
+        fake_st.sidebar.selectbox.side_effect = (
+            lambda _label, options, **_kwargs: options[0]
+        )
+        fake_st.text_input.side_effect = ["", ""]
+        fake_st.text_area.side_effect = ["normal task", external_task, external_output]
+        fake_st.button.side_effect = [False, True]
+        fake_st.sidebar.expander.return_value = MagicMock()
+        fake_st.spinner.return_value = MagicMock()
+        return fake_st
+
+    def test_runner_passes_validator_arguments_correctly(self):
+        result = RunResult(final_prompt="external output", status="APPROVED", diagnostic_info={})
+        validator = AsyncMock(return_value=result)
+
+        with patch.object(orchestrator, "validate_external_output", new=validator):
+            actual = gui.run_external_validation_sync(
+                task="original task",
+                project_context="SSOT context",
+                external_output="untrusted output",
+                preset="budget",
+                referee_model="referee-override",
+            )
+
+        assert actual is result
+        validator.assert_awaited_once_with(
+            task="original task",
+            project_context="SSOT context",
+            external_output="untrusted output",
+            preset="budget",
+            referee_model="referee-override",
+        )
+
+    def test_approved_output_renders_verdict_and_review_details(self):
+        fake_st = self._fake_streamlit()
+        result = RunResult(
+            final_prompt="agent output",
+            status="APPROVED",
+            diagnostic_info={
+                "reviews": [{"critique": ["Meets task"], "required_changes": []}],
+                "reasons": ["Meets task"],
+                "repair_prompt": None,
+            },
+        )
+        validator = MagicMock(return_value=result)
+        context_loader = MagicMock(return_value="SSOT context")
+
+        with (
+            patch.object(gui, "st", fake_st),
+            patch.object(gui, "_fetch_models_cached", return_value=[]),
+            patch.object(gui, "run_external_validation_sync", validator),
+            patch.object(orchestrator, "load_ssot_context", context_loader),
+        ):
+            gui.render_app()
+
+        selected_preset = list(config.MODEL_PRESETS)[0]
+        context_loader.assert_called_once_with()
+        validator.assert_called_once_with(
+            task="original task",
+            project_context="SSOT context",
+            external_output="agent output",
+            preset=selected_preset,
+            referee_model=None,
+        )
+        fake_st.success.assert_any_call("Verdict: APPROVED")
+        fake_st.write.assert_any_call(["Meets task"])
+        fake_st.code.assert_called_with("No repair prompt required.", language="markdown")
+
+    def test_rejected_output_renders_reasons_changes_and_repair_prompt(self):
+        fake_st = self._fake_streamlit()
+        result = RunResult(
+            final_prompt=None,
+            status="REJECT",
+            diagnostic_info={
+                "reviews": [
+                    {
+                        "critique": ["Missing verification"],
+                        "required_changes": ["Add test evidence"],
+                        "suggested_prompt": "Repair this output",
+                    }
+                ],
+                "reasons": ["Missing verification"],
+                "repair_prompt": "Repair this output",
+            },
+        )
+
+        with (
+            patch.object(gui, "st", fake_st),
+            patch.object(gui, "_fetch_models_cached", return_value=[]),
+            patch.object(gui, "run_external_validation_sync", return_value=result),
+            patch.object(orchestrator, "load_ssot_context", return_value="SSOT context"),
+        ):
+            gui.render_app()
+
+        fake_st.error.assert_any_call("Verdict: REJECT")
+        fake_st.write.assert_any_call(["Missing verification"])
+        fake_st.write.assert_any_call(["Add test evidence"])
+        fake_st.code.assert_called_with("Repair this output", language="markdown")
+
+    @pytest.mark.parametrize("task, output", [("", "agent output"), ("task", "")])
+    def test_missing_input_skips_context_loading_and_validation(self, task, output):
+        fake_st = self._fake_streamlit(external_task=task, external_output=output)
+        validator = MagicMock()
+        context_loader = MagicMock()
+
+        with (
+            patch.object(gui, "st", fake_st),
+            patch.object(gui, "_fetch_models_cached", return_value=[]),
+            patch.object(gui, "run_external_validation_sync", validator),
+            patch.object(orchestrator, "load_ssot_context", context_loader),
+        ):
+            gui.render_app()
+
+        validator.assert_not_called()
+        context_loader.assert_not_called()
+        fake_st.warning.assert_any_call(
+            "Enter both the original task and external agent output before validating."
+        )
+
+    def test_api_error_is_safe_and_never_renders_provider_detail(self):
+        fake_st = self._fake_streamlit()
+        secret_error = "provider rejected key: secret-value"
+        result = RunResult(
+            final_prompt=None,
+            status="ERROR",
+            diagnostic_info={"error": secret_error, "reviews": []},
+        )
+
+        with (
+            patch.object(gui, "st", fake_st),
+            patch.object(gui, "_fetch_models_cached", return_value=[]),
+            patch.object(gui, "run_external_validation_sync", return_value=result),
+            patch.object(orchestrator, "load_ssot_context", return_value="SSOT context"),
+        ):
+            gui.render_app()
+
+        safe_message = "External validation could not be completed. Check the configuration and retry."
+        fake_st.error.assert_called_with(safe_message)
+        rendered_values = " ".join(
+            str(call) for call in fake_st.method_calls + fake_st.sidebar.method_calls
+        )
+        assert secret_error not in rendered_values
