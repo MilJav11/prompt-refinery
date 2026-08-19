@@ -57,6 +57,25 @@ def run_pipeline_sync(
     )
 
 
+def run_external_validation_sync(
+    task: str,
+    project_context: str,
+    external_output: str,
+    preset: str | None = None,
+    referee_model: str | None = None,
+) -> RunResult:
+    """Synchronously validate untrusted external output with the Referee only."""
+    return asyncio.run(
+        orchestrator.validate_external_output(
+            task=task,
+            project_context=project_context,
+            external_output=external_output,
+            preset=preset,
+            referee_model=referee_model,
+        )
+    )
+
+
 def is_model_absent_from_list(model_id: str | None, available: list[str]) -> bool:
     """Return True when ``model_id`` is non-empty but absent from ``available``.
 
@@ -328,6 +347,71 @@ def render_app() -> None:
                 st.write(summary_str)
                 review_md = orchestrator._format_review_markdown(result.diagnostic_info)
                 st.markdown(review_md)
+
+
+    # --- Independent external-output validation ---
+    st.divider()
+    st.header("Validate External Agent Output")
+    st.caption(
+        "Independently review untrusted external-agent output against the original "
+        "task and the current project context. The submitted text is never executed."
+    )
+    external_task_input = st.text_area(
+        "Original task for validation:",
+        height=120,
+        key="external_validation_task",
+    )
+    external_output_input = st.text_area(
+        "External agent output (untrusted text):",
+        height=220,
+        key="external_validation_output",
+    )
+    validate_button = st.button("Validate External Output")
+
+    if validate_button:
+        clean_external_task = external_task_input.strip()
+        clean_external_output = external_output_input.strip()
+        if not clean_external_task or not clean_external_output:
+            st.warning("Enter both the original task and external agent output before validating.")
+            return
+
+        project_context = orchestrator.load_ssot_context()
+        with st.spinner("Validating external output with the Referee..."):
+            try:
+                external_result = run_external_validation_sync(
+                    task=clean_external_task,
+                    project_context=project_context,
+                    external_output=clean_external_output,
+                    preset=selected_preset,
+                    referee_model=referee_model,
+                )
+            except Exception:
+                # Do not surface exception details: provider errors can contain secrets.
+                st.error("External validation could not be completed. Check the configuration and retry.")
+                return
+
+        review = (external_result.diagnostic_info.get("reviews") or [{}])[-1]
+        reasons = external_result.diagnostic_info.get("reasons") or review.get("critique") or []
+        required_changes = review.get("required_changes") or []
+        repair_prompt = external_result.diagnostic_info.get("repair_prompt") or review.get(
+            "suggested_prompt"
+        )
+
+        if external_result.status == "APPROVED":
+            st.success("Verdict: APPROVED")
+        elif external_result.status == "REJECT":
+            st.error("Verdict: REJECT")
+        else:
+            # The validator returns provider/API failures as ERROR. Keep details private.
+            st.error("External validation could not be completed. Check the configuration and retry.")
+            return
+
+        st.subheader("Reasons")
+        st.write(reasons)
+        st.subheader("Required changes")
+        st.write(required_changes)
+        st.subheader("Repair prompt")
+        st.code(repair_prompt or "No repair prompt required.", language="markdown")
 
 
 def main() -> None:
