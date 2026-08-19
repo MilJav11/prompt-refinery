@@ -97,6 +97,23 @@ def is_model_absent_from_list(model_id: str | None, available: list[str]) -> boo
     return model_id not in available
 
 
+def format_markdown_bullets(items: object) -> str:
+    """Format non-empty text items as a readable Markdown bullet list.
+
+    Validation output is untrusted, so unexpected values are ignored instead of
+    being rendered via their raw Python or JSON representation.
+    """
+    if isinstance(items, str):
+        candidates = [items]
+    elif isinstance(items, (list, tuple)):
+        candidates = items
+    else:
+        candidates = []
+
+    bullets = [f"- {item.strip()}" for item in candidates if isinstance(item, str) and item.strip()]
+    return "\n".join(bullets)
+
+
 @st.cache_data(ttl=60, show_spinner=False)
 def _fetch_models_cached(api_base: str | None, api_key: str | None) -> list[str]:
     """Cached wrapper for :func:`model_discovery.fetch_available_models`.
@@ -390,7 +407,12 @@ def render_app() -> None:
                 st.error("External validation could not be completed. Check the configuration and retry.")
                 return
 
-        review = (external_result.diagnostic_info.get("reviews") or [{}])[-1]
+        reviews = external_result.diagnostic_info.get("reviews") or []
+        review = (
+            reviews[-1]
+            if isinstance(reviews, list) and reviews and isinstance(reviews[-1], dict)
+            else {}
+        )
         reasons = external_result.diagnostic_info.get("reasons") or review.get("critique") or []
         required_changes = review.get("required_changes") or []
         repair_prompt = external_result.diagnostic_info.get("repair_prompt") or review.get(
@@ -407,9 +429,9 @@ def render_app() -> None:
             return
 
         st.subheader("Reasons")
-        st.write(reasons)
+        st.markdown(format_markdown_bullets(reasons) or "No reasons provided.")
         st.subheader("Required changes")
-        st.write(required_changes)
+        st.markdown(format_markdown_bullets(required_changes) or "No required changes provided.")
         st.subheader("Repair prompt")
         st.code(repair_prompt or "No repair prompt required.", language="markdown")
 
