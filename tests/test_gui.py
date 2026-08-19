@@ -419,14 +419,14 @@ class TestExternalOutputValidation:
             referee_model="referee-override",
         )
 
-    def test_approved_output_renders_verdict_and_review_details(self):
+    def test_approved_output_renders_verdict_and_reason_bullets(self):
         fake_st = self._fake_streamlit()
         result = RunResult(
             final_prompt="agent output",
             status="APPROVED",
             diagnostic_info={
                 "reviews": [{"critique": ["Meets task"], "required_changes": []}],
-                "reasons": ["Meets task"],
+                "reasons": ["Meets task", "", "Follows constraints"],
                 "repair_prompt": None,
             },
         )
@@ -451,7 +451,10 @@ class TestExternalOutputValidation:
             referee_model=None,
         )
         fake_st.success.assert_any_call("Verdict: APPROVED")
-        fake_st.write.assert_any_call(["Meets task"])
+        fake_st.markdown.assert_any_call("- Meets task\n- Follows constraints")
+        rendered_values = " ".join(str(call) for call in fake_st.method_calls)
+        assert "[0:" not in rendered_values
+        assert "['Meets task'" not in rendered_values
         fake_st.code.assert_called_with("No repair prompt required.", language="markdown")
 
     def test_rejected_output_renders_reasons_changes_and_repair_prompt(self):
@@ -463,7 +466,7 @@ class TestExternalOutputValidation:
                 "reviews": [
                     {
                         "critique": ["Missing verification"],
-                        "required_changes": ["Add test evidence"],
+                        "required_changes": ["Add test evidence", "", "Clarify edge cases"],
                         "suggested_prompt": "Repair this output",
                     }
                 ],
@@ -481,9 +484,33 @@ class TestExternalOutputValidation:
             gui.render_app()
 
         fake_st.error.assert_any_call("Verdict: REJECT")
-        fake_st.write.assert_any_call(["Missing verification"])
-        fake_st.write.assert_any_call(["Add test evidence"])
+        fake_st.markdown.assert_any_call("- Missing verification")
+        fake_st.markdown.assert_any_call("- Add test evidence\n- Clarify edge cases")
+        rendered_values = " ".join(str(call) for call in fake_st.method_calls)
+        assert "[0:" not in rendered_values
+        assert "['Add test evidence'" not in rendered_values
         fake_st.code.assert_called_with("Repair this output", language="markdown")
+
+    def test_missing_or_empty_review_lists_render_safe_empty_messages(self):
+        fake_st = self._fake_streamlit()
+        result = RunResult(
+            final_prompt="agent output",
+            status="APPROVED",
+            diagnostic_info={"reviews": [], "reasons": [], "repair_prompt": None},
+        )
+
+        with (
+            patch.object(gui, "st", fake_st),
+            patch.object(gui, "_fetch_models_cached", return_value=[]),
+            patch.object(gui, "run_external_validation_sync", return_value=result),
+            patch.object(orchestrator, "load_ssot_context", return_value="SSOT context"),
+        ):
+            gui.render_app()
+
+        fake_st.success.assert_any_call("Verdict: APPROVED")
+        fake_st.markdown.assert_any_call("No reasons provided.")
+        fake_st.markdown.assert_any_call("No required changes provided.")
+        fake_st.code.assert_called_with("No repair prompt required.", language="markdown")
 
     @pytest.mark.parametrize("task, output", [("", "agent output"), ("task", "")])
     def test_missing_input_skips_context_loading_and_validation(self, task, output):
