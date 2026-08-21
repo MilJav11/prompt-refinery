@@ -21,6 +21,12 @@ import orchestrator
 from orchestrator import RunResult
 
 
+@pytest.fixture(autouse=True)
+def isolate_local_history(monkeypatch):
+    """Never let GUI tests read the repository's real default history file."""
+    monkeypatch.setattr(gui.history, "read_recent", lambda *_args, **_kwargs: ([], 0))
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -111,7 +117,81 @@ class TestGuiPipelineRunner:
             preset="budget",
             architect_model="custom-arch",
             referee_model="custom-ref",
+            save_history=False,
+            full_history_content=False,
         )
+
+
+class TestGuiPipelineRendering:
+    @staticmethod
+    def _fake_streamlit(*, save_history=False, full_history=False):
+        fake_st = MagicMock()
+        fake_st.sidebar.selectbox.side_effect = lambda _label, options, **_kwargs: options[0]
+        fake_st.text_input.side_effect = ["", ""]
+        fake_st.text_area.side_effect = [" pipeline task ", "", ""]
+        fake_st.button.side_effect = [True, False]
+        fake_st.checkbox.side_effect = (
+            [save_history, full_history] if save_history else [False]
+        )
+        fake_st.sidebar.expander.return_value = MagicMock()
+        fake_st.spinner.return_value = MagicMock()
+        return fake_st
+
+    def test_pipeline_error_renders_only_generic_error_not_raw_diagnostics(self):
+        fake_st = self._fake_streamlit()
+        secrets = [
+            "provider exception credential=secret",
+            "Traceback private-local-path",
+            "request_payload_with_token",
+        ]
+        result = RunResult(
+            final_prompt=None,
+            status="ERROR",
+            diagnostic_info={
+                "error": secrets[0],
+                "traceback": secrets[1],
+                "request_payload": secrets[2],
+                "reviews": [{"critique": ["raw provider diagnostic"]}],
+                "drafts": [{"zed_prompt": "raw local exception detail"}],
+            },
+        )
+        formatter = MagicMock(return_value="must not render")
+
+        with (
+            patch.object(gui, "st", fake_st),
+            patch.object(gui, "_fetch_models_cached", return_value=[]),
+            patch.object(gui, "run_pipeline_sync", return_value=result),
+            patch.object(orchestrator, "_format_review_markdown", formatter),
+        ):
+            gui.render_app()
+
+        fake_st.error.assert_any_call(
+            "Pipeline could not be completed. Check the configuration and retry."
+        )
+        formatter.assert_not_called()
+        rendered = " ".join(
+            str(call) for call in fake_st.method_calls + fake_st.sidebar.method_calls
+        )
+        for secret in [*secrets, "raw provider diagnostic", "raw local exception detail"]:
+            assert secret not in rendered
+
+    def test_full_content_checkbox_is_forwarded_to_pipeline(self):
+        fake_st = self._fake_streamlit(save_history=True, full_history=True)
+        result = RunResult(
+            final_prompt="approved prompt", status="APPROVED",
+            diagnostic_info={"metrics": {}},
+        )
+        runner = MagicMock(return_value=result)
+
+        with (
+            patch.object(gui, "st", fake_st),
+            patch.object(gui, "_fetch_models_cached", return_value=[]),
+            patch.object(gui, "run_pipeline_sync", runner),
+        ):
+            gui.render_app()
+
+        assert runner.call_args.kwargs["save_history"] is True
+        assert runner.call_args.kwargs["full_history_content"] is True
 
 
 # ---------------------------------------------------------------------------
@@ -393,6 +473,7 @@ class TestExternalOutputValidation:
         fake_st.text_input.side_effect = ["", ""]
         fake_st.text_area.side_effect = ["normal task", external_task, external_output]
         fake_st.button.side_effect = [False, True]
+        fake_st.checkbox.return_value = False
         fake_st.sidebar.expander.return_value = MagicMock()
         fake_st.spinner.return_value = MagicMock()
         return fake_st
@@ -417,7 +498,92 @@ class TestExternalOutputValidation:
             external_output="untrusted output",
             preset="budget",
             referee_model="referee-override",
+            save_history=False,
+            full_history_content=False,
+            context_source=None,
+            context_truncated=False,
         )
+
+    def test_default_opt_out_does_not_create_full_content_checkbox_or_save(self):
+        fake_st = self._fake_streamlit()
+        result = RunResult(
+            final_prompt="agent output",
+            status="APPROVED",
+            diagnostic_info={"reviews": [], "reasons": [], "repair_prompt": None},
+        )
+        validator = MagicMock(return_value=result)
+
+        with (
+            patch.object(gui, "st", fake_st),
+            patch.object(gui, "_fetch_models_cached", return_value=[]),
+            patch.object(gui, "run_external_validation_sync", validator),
+            patch.object(orchestrator, "load_ssot_context_with_evidence",
+                         return_value=("SSOT context", "PROJECT_CONTEXT.md", False)),
+            patch.object(gui.history, "append_record") as append_record,
+        ):
+            gui.render_app()
+
+        assert fake_st.checkbox.call_args_list == [
+            (("Save validation history locally",), {"value": False})
+        ]
+        validator.assert_called_once()
+        assert validator.call_args.kwargs["save_history"] is False
+        assert validator.call_args.kwargs["full_history_content"] is False
+        append_record.assert_not_called()
+
+    def test_full_content_checkbox_is_forwarded_to_external_validation(self):
+        fake_st = self._fake_streamlit()
+        fake_st.checkbox.side_effect = [True, True]
+        result = RunResult(
+            final_prompt="agent output", status="APPROVED",
+            diagnostic_info={"reviews": [], "reasons": [], "repair_prompt": None},
+        )
+        validator = MagicMock(return_value=result)
+
+        with (
+            patch.object(gui, "st", fake_st),
+            patch.object(gui, "_fetch_models_cached", return_value=[]),
+            patch.object(gui, "run_external_validation_sync", validator),
+            patch.object(
+                orchestrator, "load_ssot_context_with_evidence",
+                return_value=("SSOT context", "PROJECT_CONTEXT.md", False),
+            ),
+        ):
+            gui.render_app()
+
+        assert validator.call_args.kwargs["save_history"] is True
+        assert validator.call_args.kwargs["full_history_content"] is True
+
+    def test_history_write_failure_shows_safe_warning_without_changing_verdict(self):
+        fake_st = self._fake_streamlit()
+        raw_error = "private provider and filesystem detail"
+        result = RunResult(
+            final_prompt="agent output",
+            status="APPROVED",
+            diagnostic_info={
+                "reviews": [],
+                "reasons": ["valid"],
+                "repair_prompt": None,
+                "history_save_failed": True,
+                "error": raw_error,
+            },
+        )
+
+        with (
+            patch.object(gui, "st", fake_st),
+            patch.object(gui, "_fetch_models_cached", return_value=[]),
+            patch.object(gui, "run_external_validation_sync", return_value=result),
+            patch.object(orchestrator, "load_ssot_context_with_evidence",
+                         return_value=("SSOT context", "PROJECT_CONTEXT.md", False)),
+        ):
+            gui.render_app()
+
+        fake_st.warning.assert_any_call(
+            "Validation completed, but local history could not be saved."
+        )
+        fake_st.success.assert_any_call("Verdict: APPROVED")
+        rendered_values = " ".join(str(call) for call in fake_st.method_calls)
+        assert raw_error not in rendered_values
 
     def test_approved_output_renders_verdict_and_reason_bullets(self):
         fake_st = self._fake_streamlit()
@@ -431,13 +597,13 @@ class TestExternalOutputValidation:
             },
         )
         validator = MagicMock(return_value=result)
-        context_loader = MagicMock(return_value="SSOT context")
+        context_loader = MagicMock(return_value=("SSOT context", "PROJECT_CONTEXT.md", False))
 
         with (
             patch.object(gui, "st", fake_st),
             patch.object(gui, "_fetch_models_cached", return_value=[]),
             patch.object(gui, "run_external_validation_sync", validator),
-            patch.object(orchestrator, "load_ssot_context", context_loader),
+            patch.object(orchestrator, "load_ssot_context_with_evidence", context_loader),
         ):
             gui.render_app()
 
@@ -449,6 +615,10 @@ class TestExternalOutputValidation:
             external_output="agent output",
             preset=selected_preset,
             referee_model=None,
+            save_history=False,
+            full_history_content=False,
+            context_source="PROJECT_CONTEXT.md",
+            context_truncated=False,
         )
         fake_st.success.assert_any_call("Verdict: APPROVED")
         fake_st.markdown.assert_any_call("- Meets task\n- Follows constraints")
@@ -479,7 +649,8 @@ class TestExternalOutputValidation:
             patch.object(gui, "st", fake_st),
             patch.object(gui, "_fetch_models_cached", return_value=[]),
             patch.object(gui, "run_external_validation_sync", return_value=result),
-            patch.object(orchestrator, "load_ssot_context", return_value="SSOT context"),
+            patch.object(orchestrator, "load_ssot_context_with_evidence",
+                         return_value=("SSOT context", "PROJECT_CONTEXT.md", False)),
         ):
             gui.render_app()
 
@@ -503,7 +674,8 @@ class TestExternalOutputValidation:
             patch.object(gui, "st", fake_st),
             patch.object(gui, "_fetch_models_cached", return_value=[]),
             patch.object(gui, "run_external_validation_sync", return_value=result),
-            patch.object(orchestrator, "load_ssot_context", return_value="SSOT context"),
+            patch.object(orchestrator, "load_ssot_context_with_evidence",
+                         return_value=("SSOT context", "PROJECT_CONTEXT.md", False)),
         ):
             gui.render_app()
 
@@ -522,7 +694,7 @@ class TestExternalOutputValidation:
             patch.object(gui, "st", fake_st),
             patch.object(gui, "_fetch_models_cached", return_value=[]),
             patch.object(gui, "run_external_validation_sync", validator),
-            patch.object(orchestrator, "load_ssot_context", context_loader),
+            patch.object(orchestrator, "load_ssot_context_with_evidence", context_loader),
         ):
             gui.render_app()
 
@@ -545,7 +717,8 @@ class TestExternalOutputValidation:
             patch.object(gui, "st", fake_st),
             patch.object(gui, "_fetch_models_cached", return_value=[]),
             patch.object(gui, "run_external_validation_sync", return_value=result),
-            patch.object(orchestrator, "load_ssot_context", return_value="SSOT context"),
+            patch.object(orchestrator, "load_ssot_context_with_evidence",
+                         return_value=("SSOT context", "PROJECT_CONTEXT.md", False)),
         ):
             gui.render_app()
 
@@ -555,3 +728,25 @@ class TestExternalOutputValidation:
             str(call) for call in fake_st.method_calls + fake_st.sidebar.method_calls
         )
         assert secret_error not in rendered_values
+
+
+class TestLocalHistoryDisplay:
+    def test_history_detail_is_rendered_as_json_code(self):
+        fake_st = MagicMock()
+        fake_st.sidebar.selectbox.side_effect = lambda _label, options, **_kwargs: options[0]
+        fake_st.selectbox.side_effect = lambda _label, options, **_kwargs: options[0]
+        fake_st.text_input.side_effect = ["", ""]
+        fake_st.text_area.side_effect = ["", "", ""]
+        fake_st.button.side_effect = [False, False]
+        fake_st.checkbox.return_value = False
+        fake_st.sidebar.expander.return_value = MagicMock()
+        fake_st.spinner.return_value = MagicMock()
+        record = {"run_id": "safe-id", "content": {"external_output": "<script>alert(1)</script>"}}
+        with (
+            patch.object(gui, "st", fake_st),
+            patch.object(gui, "_fetch_models_cached", return_value=[]),
+            patch.object(gui.history, "read_recent", return_value=([record], 1)),
+        ):
+            gui.render_app()
+        fake_st.code.assert_called_with(json.dumps(record, ensure_ascii=False, indent=2), language="json")
+        fake_st.warning.assert_any_call("Skipped 1 malformed history record(s).")
