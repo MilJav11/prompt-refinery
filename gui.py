@@ -7,9 +7,11 @@ Run locally via:
 from __future__ import annotations
 
 import asyncio
+import json
 import streamlit as st
 
 import config
+import history
 import model_discovery
 import orchestrator
 from orchestrator import RunResult
@@ -45,6 +47,8 @@ def run_pipeline_sync(
     preset: str | None = None,
     architect_model: str | None = None,
     referee_model: str | None = None,
+    save_history: bool = False,
+    full_history_content: bool = False,
 ) -> RunResult:
     """Synchronously run orchestrator.run_pipeline using asyncio.run."""
     return asyncio.run(
@@ -53,6 +57,8 @@ def run_pipeline_sync(
             preset=preset,
             architect_model=architect_model,
             referee_model=referee_model,
+            save_history=save_history,
+            full_history_content=full_history_content,
         )
     )
 
@@ -63,6 +69,10 @@ def run_external_validation_sync(
     external_output: str,
     preset: str | None = None,
     referee_model: str | None = None,
+    save_history: bool = False,
+    full_history_content: bool = False,
+    context_source: str | None = None,
+    context_truncated: bool = False,
 ) -> RunResult:
     """Synchronously validate untrusted external output with the Referee only."""
     return asyncio.run(
@@ -72,6 +82,10 @@ def run_external_validation_sync(
             external_output=external_output,
             preset=preset,
             referee_model=referee_model,
+            save_history=save_history,
+            full_history_content=full_history_content,
+            context_source=context_source,
+            context_truncated=context_truncated,
         )
     )
 
@@ -310,6 +324,14 @@ def render_app() -> None:
         placeholder="e.g. Add exponential backoff retry logic to the HTTP connection handler in orchestrator.py",
     )
 
+    save_history = st.checkbox("Save validation history locally", value=False)
+    full_history_content = False
+    if save_history:
+        st.warning("Full prompts and outputs may contain personal, internal, or sensitive data.")
+        full_history_content = st.checkbox(
+            "Include full prompts and outputs (may contain sensitive data)", value=False
+        )
+
     refine_button = st.button("🚀 Refine Prompt", type="primary")
 
     if refine_button:
@@ -325,12 +347,16 @@ def render_app() -> None:
                     preset=selected_preset,
                     architect_model=architect_model,
                     referee_model=referee_model,
+                    save_history=save_history,
+                    full_history_content=full_history_content,
                 )
-            except Exception as exc:  # Safety net for unexpected runtime errors
-                st.error(f"Unexpected error executing pipeline: {exc}")
+            except Exception:  # Do not reveal provider or local exception details.
+                st.error("Pipeline could not be completed. Check the configuration and retry.")
                 return
 
         summary_str = orchestrator.format_metrics_summary(result.diagnostic_info)
+        if result.diagnostic_info.get("history_save_failed"):
+            st.warning("Validation completed, but local history could not be saved.")
 
         if result.status == "APPROVED":
             st.success("Prompt successfully generated and verified!")
@@ -349,12 +375,8 @@ def render_app() -> None:
                     if calls:
                         st.write("**Per-Stage Breakdown:**")
                         st.dataframe(calls)
-        else:
-            if result.status == "REJECT":
-                st.error("Pipeline run ended in REJECT after maximum fix attempts.")
-            else:
-                err_msg = result.diagnostic_info.get("error", "Unknown error")
-                st.error(f"Pipeline run ended in ERROR: {err_msg}")
+        elif result.status == "REJECT":
+            st.error("Pipeline run ended in REJECT after maximum fix attempts.")
 
             st.subheader("💡 Suggested Fallback Prompt")
             fallback_text = get_fallback_prompt_text(result.diagnostic_info)
@@ -364,6 +386,10 @@ def render_app() -> None:
                 st.write(summary_str)
                 review_md = orchestrator._format_review_markdown(result.diagnostic_info)
                 st.markdown(review_md)
+        else:
+            # ERROR diagnostics can include credentials, payloads, paths, and
+            # tracebacks, so this branch deliberately renders no diagnostics.
+            st.error("Pipeline could not be completed. Check the configuration and retry.")
 
 
     # --- Independent external-output validation ---
@@ -392,7 +418,7 @@ def render_app() -> None:
             st.warning("Enter both the original task and external agent output before validating.")
             return
 
-        project_context = orchestrator.load_ssot_context()
+        project_context, context_source, context_truncated = orchestrator.load_ssot_context_with_evidence()
         with st.spinner("Validating external output with the Referee..."):
             try:
                 external_result = run_external_validation_sync(
@@ -401,6 +427,10 @@ def render_app() -> None:
                     external_output=clean_external_output,
                     preset=selected_preset,
                     referee_model=referee_model,
+                    save_history=save_history,
+                    full_history_content=full_history_content,
+                    context_source=context_source,
+                    context_truncated=context_truncated,
                 )
             except Exception:
                 # Do not surface exception details: provider errors can contain secrets.
@@ -408,6 +438,8 @@ def render_app() -> None:
                 return
 
         reviews = external_result.diagnostic_info.get("reviews") or []
+        if external_result.diagnostic_info.get("history_save_failed"):
+            st.warning("Validation completed, but local history could not be saved.")
         review = (
             reviews[-1]
             if isinstance(reviews, list) and reviews and isinstance(reviews[-1], dict)
@@ -434,6 +466,19 @@ def render_app() -> None:
         st.markdown(format_markdown_bullets(required_changes) or "No required changes provided.")
         st.subheader("Repair prompt")
         st.code(repair_prompt or "No repair prompt required.", language="markdown")
+
+    st.divider()
+    st.header("Local validation history")
+    records, skipped = history.read_recent()
+    if skipped:
+        st.warning(f"Skipped {skipped} malformed history record(s).")
+    if not records:
+        st.caption("No local validation history is available.")
+    else:
+        by_id = {str(record.get("run_id", "unknown")): record for record in records}
+        selected_id = st.selectbox("History run ID", list(by_id))
+        # JSON code rendering is plain text; untrusted record content is never HTML.
+        st.code(json.dumps(by_id[selected_id], ensure_ascii=False, indent=2), language="json")
 
 
 def main() -> None:

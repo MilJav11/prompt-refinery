@@ -19,6 +19,7 @@ from litellm.types.utils import ModelResponse
 from pydantic import BaseModel, ValidationError
 
 import config
+import history
 from schemas import ArchitectDraft, RefereeReview, RunResult
 
 
@@ -382,6 +383,12 @@ def load_ssot_context(
     ``base_dir``). Returns an empty string if neither file exists or is
     readable.
     """
+    context, _, _ = load_ssot_context_with_evidence(base_dir, max_chars)
+    return context
+
+
+def load_ssot_context_with_evidence(base_dir: str | Path = ".", max_chars: int = config.CONTEXT_MAX_CHARS) -> tuple[str, str | None, bool]:
+    """Load context with its winning source and truncation fact, preserving priority."""
     base = Path(base_dir)
     for relative in config.CONTEXT_FILENAMES:
         candidate = base / relative
@@ -390,8 +397,33 @@ def load_ssot_context(
                 text = candidate.read_text(encoding="utf-8", errors="replace")
             except OSError:
                 continue
-            return text[:max_chars]
-    return ""
+            return text[:max_chars], str(relative).replace("\\", "/"), len(text) > max_chars
+    return "", None, False
+
+
+def _record_history_safely(**kwargs: Any) -> bool:
+    try:
+        history_path = kwargs.pop("history_path")
+        history.append_record(history.build_record(**kwargs), history_path)
+        return True
+    except (OSError, TypeError, ValueError):
+        return False
+
+
+def _persist_history(result: RunResult, *, save_history: bool, kind: str, task: str,
+                     context: str, context_source: str | None, context_truncated: bool,
+                     resolved_models: dict[str, str | None], full_opt_in: bool,
+                     history_path: str | Path, external_output: str | None = None) -> RunResult:
+    """Append exactly once for a completed opted-in result, without changing it on failure."""
+    if save_history and not _record_history_safely(
+        kind=kind, status=result.status, task=task, context=context,
+        context_source=context_source, context_truncated=context_truncated,
+        diagnostic_info=result.diagnostic_info, resolved_models=resolved_models,
+        full_opt_in=full_opt_in, external_output=external_output,
+        final_prompt=result.final_prompt, history_path=history_path,
+    ):
+        result.diagnostic_info["history_save_failed"] = True
+    return result
 
 
 def _provider_call_kwargs() -> dict[str, Any]:
@@ -673,12 +705,18 @@ async def validate_external_output(
     referee_model: str | None = None,
     timeout: float | None = None,
     preset: str | None = None,
+    save_history: bool = False,
+    full_history_content: bool = False,
+    history_path: str | Path = history.DEFAULT_HISTORY_PATH,
+    context_source: str | None = None,
+    context_truncated: bool = False,
 ) -> RunResult:
     """Independently validate untrusted external output using only the Referee.
 
-    This path does not invoke the Architect, the Architect repair cycle, or any
-    writer. It performs one structured Referee request (plus the existing
-    same-model JSON-format repair only if required) and never writes files.
+    This path does not invoke the Architect or its repair cycle. It performs
+    one structured Referee request (plus the existing same-model JSON-format
+    repair only if required). When explicitly opted in, it appends one local
+    validation-history record.
     """
     timeout = timeout if timeout is not None else config.REQUEST_TIMEOUT
     metrics = PipelineMetrics()
@@ -699,7 +737,7 @@ async def validate_external_output(
         diagnostic_info["status"] = "ERROR"
         diagnostic_info["error"] = str(exc)
         diagnostic_info["metrics"] = metrics.to_dict()
-        return RunResult(final_prompt=None, status="ERROR", diagnostic_info=diagnostic_info)
+        return _persist_history(RunResult(final_prompt=None, status="ERROR", diagnostic_info=diagnostic_info), save_history=save_history, kind="external_validation", task=task, context=project_context, context_source=context_source, context_truncated=context_truncated, resolved_models={"referee": referee_model}, full_opt_in=full_history_content, history_path=history_path, external_output=external_output)
 
     messages = [
         {"role": "system", "content": EXTERNAL_REFEREE_SYSTEM_PROMPT},
@@ -729,16 +767,18 @@ async def validate_external_output(
         diagnostic_info["repair_prompt"] = review.suggested_prompt
         diagnostic_info["status"] = review.status
         diagnostic_info["metrics"] = metrics.to_dict()
-        return RunResult(
+        result = RunResult(
             final_prompt=external_output if review.status == "APPROVED" else None,
             status=review.status,
             diagnostic_info=diagnostic_info,
         )
+        return _persist_history(result, save_history=save_history, kind="external_validation", task=task, context=project_context, context_source=context_source, context_truncated=context_truncated, resolved_models={"referee": resolved_referee_model}, full_opt_in=full_history_content, history_path=history_path, external_output=external_output)
     except (LLMCallError, JSONRepairError) as exc:
         diagnostic_info["status"] = "ERROR"
         diagnostic_info["error"] = str(exc)
         diagnostic_info["metrics"] = metrics.to_dict()
-        return RunResult(final_prompt=None, status="ERROR", diagnostic_info=diagnostic_info)
+        result = RunResult(final_prompt=None, status="ERROR", diagnostic_info=diagnostic_info)
+        return _persist_history(result, save_history=save_history, kind="external_validation", task=task, context=project_context, context_source=context_source, context_truncated=context_truncated, resolved_models={"referee": resolved_referee_model}, full_opt_in=full_history_content, history_path=history_path, external_output=external_output)
 
 
 def _contract_violation_review(result: ContractValidationResult) -> RefereeReview:
@@ -987,6 +1027,9 @@ async def run_pipeline(
     context_dir: str | Path = ".",
     zed_dir: str | Path = config.ZED_DIR,
     preset: str | None = None,
+    save_history: bool = False,
+    full_history_content: bool = False,
+    history_path: str | Path = history.DEFAULT_HISTORY_PATH,
 ) -> RunResult:
     """Run the full Architect -> Referee -> Fix -> Re-check loop.
 
@@ -1033,10 +1076,10 @@ async def run_pipeline(
             write_review(diagnostic_info, zed_dir)
         except OSError:
             pass
-        return RunResult(final_prompt=None, status="ERROR", diagnostic_info=diagnostic_info)
+        return _persist_history(RunResult(final_prompt=None, status="ERROR", diagnostic_info=diagnostic_info), save_history=save_history, kind="pipeline", task=task, context="", context_source=None, context_truncated=False, resolved_models={"architect": architect_model, "referee": referee_model}, full_opt_in=full_history_content, history_path=history_path)
 
     try:
-        context = load_ssot_context(context_dir)
+        context, context_source, context_truncated = load_ssot_context_with_evidence(context_dir)
 
         draft, draft1_metrics = await run_architect(
             task, context, architect_model, timeout, stage="architect_draft_1"
@@ -1056,13 +1099,14 @@ async def run_pipeline(
             diagnostic_info["metrics"] = metrics.to_dict()
             failure = _finalize_approved(draft, diagnostic_info, zed_dir)
             if failure is not None:
-                return failure
+                return _persist_history(failure, save_history=save_history, kind="pipeline", task=task, context=context, context_source=context_source, context_truncated=context_truncated, resolved_models={"architect": architect_model, "referee": referee_model}, full_opt_in=full_history_content, history_path=history_path)
             diagnostic_info["status"] = "APPROVED"
-            return RunResult(
+            result = RunResult(
                 final_prompt=draft.zed_prompt,
                 status="APPROVED",
                 diagnostic_info=diagnostic_info,
             )
+            return _persist_history(result, save_history=save_history, kind="pipeline", task=task, context=context, context_source=context_source, context_truncated=context_truncated, resolved_models={"architect": architect_model, "referee": referee_model}, full_opt_in=full_history_content, history_path=history_path)
 
         # Single fix cycle: give the Architect the Referee's feedback, then
         # re-verify with a mandatory second Referee pass (also contract-gated).
@@ -1083,18 +1127,20 @@ async def run_pipeline(
             diagnostic_info["metrics"] = metrics.to_dict()
             failure = _finalize_approved(fixed_draft, diagnostic_info, zed_dir)
             if failure is not None:
-                return failure
+                return _persist_history(failure, save_history=save_history, kind="pipeline", task=task, context=context, context_source=context_source, context_truncated=context_truncated, resolved_models={"architect": architect_model, "referee": referee_model}, full_opt_in=full_history_content, history_path=history_path)
             diagnostic_info["status"] = "APPROVED"
-            return RunResult(
+            result = RunResult(
                 final_prompt=fixed_draft.zed_prompt,
                 status="APPROVED",
                 diagnostic_info=diagnostic_info,
             )
+            return _persist_history(result, save_history=save_history, kind="pipeline", task=task, context=context, context_source=context_source, context_truncated=context_truncated, resolved_models={"architect": architect_model, "referee": referee_model}, full_opt_in=full_history_content, history_path=history_path)
 
         diagnostic_info["status"] = "REJECT"
         diagnostic_info["metrics"] = metrics.to_dict()
         write_review(diagnostic_info, zed_dir)
-        return RunResult(final_prompt=None, status="REJECT", diagnostic_info=diagnostic_info)
+        result = RunResult(final_prompt=None, status="REJECT", diagnostic_info=diagnostic_info)
+        return _persist_history(result, save_history=save_history, kind="pipeline", task=task, context=context, context_source=context_source, context_truncated=context_truncated, resolved_models={"architect": architect_model, "referee": referee_model}, full_opt_in=full_history_content, history_path=history_path)
 
     except (LLMCallError, JSONRepairError, OSError) as exc:
         diagnostic_info["status"] = "ERROR"
@@ -1106,7 +1152,8 @@ async def run_pipeline(
             write_review(diagnostic_info, zed_dir)
         except OSError:
             pass
-        return RunResult(final_prompt=None, status="ERROR", diagnostic_info=diagnostic_info)
+        result = RunResult(final_prompt=None, status="ERROR", diagnostic_info=diagnostic_info)
+        return _persist_history(result, save_history=save_history, kind="pipeline", task=task, context=locals().get("context", ""), context_source=locals().get("context_source"), context_truncated=bool(locals().get("context_truncated", False)), resolved_models={"architect": architect_model, "referee": referee_model}, full_opt_in=full_history_content, history_path=history_path)
 
 
 _ALLOWED_OUTCOMES: frozenset[str] = frozenset(
