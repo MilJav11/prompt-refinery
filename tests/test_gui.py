@@ -7,6 +7,12 @@ No real network calls are made; all HTTP interactions are mocked at the
 
 from __future__ import annotations
 
+import os
+
+# Use LiteLLM's bundled cost map before collection imports orchestration.
+os.environ["LITELLM_LOCAL_MODEL_COST_MAP"] = "True"
+os.environ["PYTHON_DOTENV_DISABLED"] = "1"
+
 import json
 from io import BytesIO
 from types import SimpleNamespace
@@ -609,7 +615,7 @@ class TestExternalOutputValidation:
             gui.render_app()
 
         selected_preset = list(config.MODEL_PRESETS)[0]
-        context_loader.assert_called_once_with()
+        context_loader.assert_called_once_with(config.resolve_project_paths())
         validator.assert_called_once_with(
             task="original task",
             project_context="SSOT context",
@@ -620,6 +626,7 @@ class TestExternalOutputValidation:
             full_history_content=False,
             context_source="PROJECT_CONTEXT.md",
             context_truncated=False,
+            history_path=config.APPLICATION_STARTUP_DIR / ".zed" / "validation_history.jsonl",
         )
         fake_st.success.assert_any_call("Verdict: APPROVED")
         fake_st.markdown.assert_any_call("- Meets task\n- Follows constraints")
@@ -784,6 +791,22 @@ class TestLocalHistoryDisplay:
         assert options[0] == "2026-08-21 12:03 | PIPELINE | APPROVED | auto/coding:free"
         assert options[1] == "2026-08-21 11:56 | PIPELINE | REJECT | auto/coding:free"
         assert "new" not in options[0]
+
+    def test_project_switch_resets_history_selection_to_new_projects_first_run(self):
+        fake_st = self._fake_streamlit()
+        fake_st.session_state = {
+            "_reset_history_browser_selection": True,
+            "history_browser_selection": "old project selection",
+        }
+        record = self._record(run_id="new-project-run")
+        options, _ = gui._history_options([record])
+        with (
+            patch.object(gui, "st", fake_st),
+            patch.object(gui.history, "read_recent", return_value=([record], 0)),
+        ):
+            gui.render_history_browser()
+        assert "_reset_history_browser_selection" not in fake_st.session_state
+        assert fake_st.session_state["history_browser_selection"] == options[0]
 
     def test_selector_labels_preserve_records_when_natural_suffix_collides(self):
         first = self._record(run_id="first")
@@ -1083,7 +1106,7 @@ class TestLocalHistoryDisplay:
             patch.object(gui, "_fetch_models_cached") as fetch_models,
         ):
             gui.render_history_browser()
-        reader.assert_called_once_with(limit=20)
+        reader.assert_called_once_with(config.resolve_project_paths().validation_history, limit=20)
         append_record.assert_not_called()
         pipeline.assert_not_called()
         external.assert_not_called()

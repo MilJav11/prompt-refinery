@@ -59,6 +59,118 @@ CONTEXT_FILENAMES: tuple[str, ...] = (
 # Directory where the final prompt / review diagnostics are written.
 ZED_DIR: str = os.getenv("VCF_ZED_DIR", ".zed")
 
+
+# Project paths are deliberately separate from provider configuration.  They
+# are resolved once by a workflow entry point and never change the process
+# working directory or load configuration from the selected project.
+APPLICATION_STARTUP_DIR = Path.cwd().resolve()
+
+
+class ProjectRootError(ValueError):
+    """Raised when a requested project scope is invalid or ambiguous."""
+
+
+@dataclass(frozen=True)
+class ProjectPaths:
+    """Immutable, resolved locations owned by one canonical project root."""
+
+    root: Path
+    project_context: Path
+    legacy_memory: Path
+    structured_memory: Path
+    artifact_dir: Path
+    validation_history: Path
+
+    @classmethod
+    def from_root(cls, root: Path, *, zed_dir: str | Path = ".zed") -> "ProjectPaths":
+        paths = cls(
+            root=root,
+            project_context=root / "PROJECT_CONTEXT.md",
+            legacy_memory=root / "docs" / "MEMORY.md",
+            structured_memory=root / ".prompt-refinery" / "memory.json",
+            artifact_dir=root / ".zed",
+            validation_history=root / ".zed" / "validation_history.jsonl",
+        )
+        # Legacy VCF_ZED_DIR only relocates prompt/review artifacts. History
+        # retains its existing .zed/validation_history.jsonl storage location.
+        return cls(
+            root=paths.root,
+            project_context=paths.project_context,
+            legacy_memory=paths.legacy_memory,
+            structured_memory=paths.structured_memory,
+            artifact_dir=paths.contained_path(zed_dir, paths.artifact_dir, label="VCF_ZED_DIR"),
+            validation_history=paths.validation_history,
+        )
+
+    def contained_path(self, value: str | Path | None, default: Path, *, label: str) -> Path:
+        """Resolve a project-relative override without permitting ``..`` escape."""
+        if value is None:
+            return default
+        candidate = Path(value)
+        if candidate.is_absolute():
+            return candidate.resolve()
+        resolved = (self.root / candidate).resolve()
+        try:
+            resolved.relative_to(self.root)
+        except ValueError as exc:
+            raise ProjectRootError(
+                f"Relative {label} must stay within project root {self.root}: {value!s}"
+            ) from exc
+        return resolved
+
+
+def _resolve_root_input(value: str | Path, startup_dir: Path, *, source: str) -> Path:
+    raw = Path(value)
+    resolved = raw.resolve() if raw.is_absolute() else (startup_dir / raw).resolve()
+    if not resolved.exists():
+        raise ProjectRootError(f"{source} does not exist: {resolved}")
+    if not resolved.is_dir():
+        raise ProjectRootError(f"{source} is not a directory: {resolved}")
+    return resolved
+
+
+def resolve_project_paths(
+    project_root: str | Path | None = None,
+    context_dir: str | Path | None = None,
+    *,
+    startup_dir: str | Path | None = None,
+    environ: dict[str, str] | None = None,
+) -> ProjectPaths:
+    """Resolve project scope with explicit values taking deterministic priority.
+
+    Relative inputs are always interpreted against the captured application
+    startup directory, rather than a caller's later current directory.
+    """
+    startup = Path(startup_dir).resolve() if startup_dir is not None else APPLICATION_STARTUP_DIR
+    environment = os.environ if environ is None else environ
+    explicit_root = (
+        _resolve_root_input(project_root, startup, source="project_root")
+        if project_root is not None
+        else None
+    )
+    explicit_context = (
+        _resolve_root_input(context_dir, startup, source="context_dir")
+        if context_dir is not None
+        else None
+    )
+    if explicit_root is not None and explicit_context is not None and explicit_root != explicit_context:
+        raise ProjectRootError(
+            "project_root and context_dir resolve to different directories: "
+            f"{explicit_root} != {explicit_context}"
+        )
+    if explicit_root is not None:
+        root = explicit_root
+    elif explicit_context is not None:
+        root = explicit_context
+    else:
+        environment_root = environment.get("VCF_PROJECT_ROOT")
+        root = (
+            _resolve_root_input(environment_root, startup, source="VCF_PROJECT_ROOT")
+            if environment_root
+            else _resolve_root_input(startup, startup, source="application startup directory")
+        )
+    return ProjectPaths.from_root(root, zed_dir=environment.get("VCF_ZED_DIR", ZED_DIR if environ is None else ".zed"))
+
 # ---------------------------------------------------------------------------
 # Model Presets
 # ---------------------------------------------------------------------------

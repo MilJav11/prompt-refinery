@@ -9,6 +9,12 @@ accepts.
 
 from __future__ import annotations
 
+import os
+
+# Use LiteLLM's bundled cost map before collection imports orchestration.
+os.environ["LITELLM_LOCAL_MODEL_COST_MAP"] = "True"
+os.environ["PYTHON_DOTENV_DISABLED"] = "1"
+
 import asyncio
 import json
 import sys
@@ -512,7 +518,7 @@ class TestSsotContext:
 
 class TestCli:
     def test_main_returns_zero_and_writes_prompt_on_approval(self, tmp_path, monkeypatch):
-        monkeypatch.chdir(tmp_path)
+        monkeypatch.setattr(config, "APPLICATION_STARTUP_DIR", tmp_path)
         expected_prompt = compliant_prompt("ok")
         mock = AsyncMock(
             side_effect=[
@@ -523,14 +529,15 @@ class TestCli:
         monkeypatch.setattr(orchestrator.litellm, "acompletion", mock)
 
         exit_code = vcf.main(
-            ["Add retry logic", "--architect-model", "fake/a", "--referee-model", "fake/r"]
+            ["Add retry logic", "--architect-model", "fake/a", "--referee-model", "fake/r",
+             "--project-root", str(tmp_path)]
         )
 
         assert exit_code == 0
         assert (tmp_path / ".zed" / "prompt.md").read_text(encoding="utf-8") == expected_prompt
 
     def test_main_returns_one_and_no_prompt_write_on_reject(self, tmp_path, monkeypatch):
-        monkeypatch.chdir(tmp_path)
+        monkeypatch.setattr(config, "APPLICATION_STARTUP_DIR", tmp_path)
         mock = AsyncMock(
             side_effect=[
                 llm_response(draft_json(prompt=compliant_prompt("v1"))),
@@ -542,7 +549,8 @@ class TestCli:
         monkeypatch.setattr(orchestrator.litellm, "acompletion", mock)
 
         exit_code = vcf.main(
-            ["task", "--architect-model", "fake/a", "--referee-model", "fake/r"]
+            ["task", "--architect-model", "fake/a", "--referee-model", "fake/r",
+             "--project-root", str(tmp_path)]
         )
 
         assert exit_code == 1
@@ -1273,7 +1281,7 @@ class TestCostAndTokenTracking:
 
     def test_cli_summary_line_printed_with_usage(self, tmp_path, monkeypatch, capsys):
         """The [VCF] summary line is printed to stdout with token count and cost."""
-        monkeypatch.chdir(tmp_path)
+        monkeypatch.setattr(config, "APPLICATION_STARTUP_DIR", tmp_path)
         arch_usage = self._make_usage(100, 50, 150)
         ref_usage = self._make_usage(200, 80, 280)
         mock = AsyncMock(
@@ -1296,7 +1304,7 @@ class TestCostAndTokenTracking:
 
     def test_cli_summary_line_unavailable_without_usage(self, tmp_path, monkeypatch, capsys):
         """When no usage data is present, the CLI prints 'unavailable'."""
-        monkeypatch.chdir(tmp_path)
+        monkeypatch.setattr(config, "APPLICATION_STARTUP_DIR", tmp_path)
         mock = AsyncMock(
             side_effect=[
                 llm_response(draft_json(prompt=compliant_prompt("ok"))),
@@ -1643,7 +1651,7 @@ class TestCliPreset:
         Monkeypatches MODEL_PRESETS to the built-in budget value so this test
         is isolated from any external presets.json present in the project root.
         """
-        monkeypatch.chdir(tmp_path)
+        monkeypatch.setattr(config, "APPLICATION_STARTUP_DIR", tmp_path)
         monkeypatch.setitem(
             config.MODEL_PRESETS,
             "budget",
@@ -1670,7 +1678,7 @@ class TestCliPreset:
 
         Monkeypatches MODEL_PRESETS to the built-in budget value for isolation.
         """
-        monkeypatch.chdir(tmp_path)
+        monkeypatch.setattr(config, "APPLICATION_STARTUP_DIR", tmp_path)
         monkeypatch.setitem(
             config.MODEL_PRESETS,
             "budget",
@@ -1698,7 +1706,7 @@ class TestCliPreset:
 
     def test_short_flag_p_accepted(self, tmp_path, monkeypatch):
         """-p is accepted as an alias for --preset."""
-        monkeypatch.chdir(tmp_path)
+        monkeypatch.setattr(config, "APPLICATION_STARTUP_DIR", tmp_path)
         expected_prompt = compliant_prompt("short flag")
         mock = AsyncMock(
             side_effect=[

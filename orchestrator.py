@@ -374,7 +374,7 @@ def validate_prompt_contract(zed_prompt: str) -> ContractValidationResult:
 
 
 def load_ssot_context(
-    base_dir: str | Path = ".",
+    base_dir: str | Path | config.ProjectPaths = ".",
     max_chars: int = config.CONTEXT_MAX_CHARS,
 ) -> str:
     """Load up to ``max_chars`` characters from the first SSOT context file found.
@@ -387,11 +387,16 @@ def load_ssot_context(
     return context
 
 
-def load_ssot_context_with_evidence(base_dir: str | Path = ".", max_chars: int = config.CONTEXT_MAX_CHARS) -> tuple[str, str | None, bool]:
+def load_ssot_context_with_evidence(base_dir: str | Path | config.ProjectPaths = ".", max_chars: int = config.CONTEXT_MAX_CHARS) -> tuple[str, str | None, bool]:
     """Load context with its winning source and truncation fact, preserving priority."""
-    base = Path(base_dir)
-    for relative in config.CONTEXT_FILENAMES:
-        candidate = base / relative
+    if isinstance(base_dir, config.ProjectPaths):
+        candidates = (
+            ("PROJECT_CONTEXT.md", base_dir.project_context),
+            ("docs/MEMORY.md", base_dir.legacy_memory),
+        )
+    else:
+        candidates = tuple((relative, Path(base_dir) / relative) for relative in config.CONTEXT_FILENAMES)
+    for relative, candidate in candidates:
         if candidate.is_file():
             try:
                 text = candidate.read_text(encoding="utf-8", errors="replace")
@@ -1024,12 +1029,14 @@ async def run_pipeline(
     architect_model: str | None = None,
     referee_model: str | None = None,
     timeout: float | None = None,
-    context_dir: str | Path = ".",
-    zed_dir: str | Path = config.ZED_DIR,
+    context_dir: str | Path | None = None,
+    zed_dir: str | Path | None = None,
     preset: str | None = None,
     save_history: bool = False,
     full_history_content: bool = False,
-    history_path: str | Path = history.DEFAULT_HISTORY_PATH,
+    history_path: str | Path | None = None,
+    project_root: str | Path | None = None,
+    project_paths: config.ProjectPaths | None = None,
 ) -> RunResult:
     """Run the full Architect -> Referee -> Fix -> Re-check loop.
 
@@ -1051,13 +1058,40 @@ async def run_pipeline(
         ``referee_model`` arguments always take priority over the preset.
         An unknown preset name causes an immediate ERROR ``RunResult``.
     """
-    timeout = timeout if timeout is not None else config.REQUEST_TIMEOUT
-
     diagnostic_info: dict[str, Any] = {"task": task, "drafts": [], "reviews": []}
 
     # Instantiated BEFORE the try block so the accumulator survives into the
     # except handler and partial metrics from successful calls are not lost.
     metrics = PipelineMetrics()
+
+    # Resolve scope before provider/model resolution, context reads, or any
+    # artifact/history write.  Invalid explicit configuration must be inert.
+    try:
+        if project_paths is None:
+            project_paths = config.resolve_project_paths(
+                project_root=project_root,
+                context_dir=context_dir,
+            )
+        elif project_root is not None or context_dir is not None:
+            raise config.ProjectRootError(
+                "project_paths cannot be combined with project_root or context_dir"
+            )
+        resolved_zed_dir = project_paths.contained_path(
+            zed_dir, project_paths.artifact_dir, label="zed_dir"
+        )
+        resolved_history_path = project_paths.contained_path(
+            history_path, project_paths.validation_history, label="history_path"
+        )
+    except config.ProjectRootError as exc:
+        diagnostic_info["status"] = "ERROR"
+        diagnostic_info["error"] = str(exc)
+        diagnostic_info["metrics"] = metrics.to_dict()
+        return RunResult(final_prompt=None, status="ERROR", diagnostic_info=diagnostic_info)
+
+    diagnostic_info["project_root"] = str(project_paths.root)
+    diagnostic_info["artifact_dir"] = str(resolved_zed_dir)
+    diagnostic_info["history_path"] = str(resolved_history_path)
+    timeout = timeout if timeout is not None else config.REQUEST_TIMEOUT
 
     # Resolve models via config.resolve_models so that preset, explicit overrides,
     # and env-var defaults are applied with the documented priority order.
@@ -1073,13 +1107,13 @@ async def run_pipeline(
         diagnostic_info["error"] = str(exc)
         diagnostic_info["metrics"] = metrics.to_dict()
         try:
-            write_review(diagnostic_info, zed_dir)
+            write_review(diagnostic_info, resolved_zed_dir)
         except OSError:
             pass
-        return _persist_history(RunResult(final_prompt=None, status="ERROR", diagnostic_info=diagnostic_info), save_history=save_history, kind="pipeline", task=task, context="", context_source=None, context_truncated=False, resolved_models={"architect": architect_model, "referee": referee_model}, full_opt_in=full_history_content, history_path=history_path)
+        return _persist_history(RunResult(final_prompt=None, status="ERROR", diagnostic_info=diagnostic_info), save_history=save_history, kind="pipeline", task=task, context="", context_source=None, context_truncated=False, resolved_models={"architect": architect_model, "referee": referee_model}, full_opt_in=full_history_content, history_path=resolved_history_path)
 
     try:
-        context, context_source, context_truncated = load_ssot_context_with_evidence(context_dir)
+        context, context_source, context_truncated = load_ssot_context_with_evidence(project_paths)
 
         draft, draft1_metrics = await run_architect(
             task, context, architect_model, timeout, stage="architect_draft_1"
@@ -1097,16 +1131,16 @@ async def run_pipeline(
 
         if review.status == "APPROVED":
             diagnostic_info["metrics"] = metrics.to_dict()
-            failure = _finalize_approved(draft, diagnostic_info, zed_dir)
+            failure = _finalize_approved(draft, diagnostic_info, resolved_zed_dir)
             if failure is not None:
-                return _persist_history(failure, save_history=save_history, kind="pipeline", task=task, context=context, context_source=context_source, context_truncated=context_truncated, resolved_models={"architect": architect_model, "referee": referee_model}, full_opt_in=full_history_content, history_path=history_path)
+                return _persist_history(failure, save_history=save_history, kind="pipeline", task=task, context=context, context_source=context_source, context_truncated=context_truncated, resolved_models={"architect": architect_model, "referee": referee_model}, full_opt_in=full_history_content, history_path=resolved_history_path)
             diagnostic_info["status"] = "APPROVED"
             result = RunResult(
                 final_prompt=draft.zed_prompt,
                 status="APPROVED",
                 diagnostic_info=diagnostic_info,
             )
-            return _persist_history(result, save_history=save_history, kind="pipeline", task=task, context=context, context_source=context_source, context_truncated=context_truncated, resolved_models={"architect": architect_model, "referee": referee_model}, full_opt_in=full_history_content, history_path=history_path)
+            return _persist_history(result, save_history=save_history, kind="pipeline", task=task, context=context, context_source=context_source, context_truncated=context_truncated, resolved_models={"architect": architect_model, "referee": referee_model}, full_opt_in=full_history_content, history_path=resolved_history_path)
 
         # Single fix cycle: give the Architect the Referee's feedback, then
         # re-verify with a mandatory second Referee pass (also contract-gated).
@@ -1125,22 +1159,22 @@ async def run_pipeline(
 
         if second_review.status == "APPROVED":
             diagnostic_info["metrics"] = metrics.to_dict()
-            failure = _finalize_approved(fixed_draft, diagnostic_info, zed_dir)
+            failure = _finalize_approved(fixed_draft, diagnostic_info, resolved_zed_dir)
             if failure is not None:
-                return _persist_history(failure, save_history=save_history, kind="pipeline", task=task, context=context, context_source=context_source, context_truncated=context_truncated, resolved_models={"architect": architect_model, "referee": referee_model}, full_opt_in=full_history_content, history_path=history_path)
+                return _persist_history(failure, save_history=save_history, kind="pipeline", task=task, context=context, context_source=context_source, context_truncated=context_truncated, resolved_models={"architect": architect_model, "referee": referee_model}, full_opt_in=full_history_content, history_path=resolved_history_path)
             diagnostic_info["status"] = "APPROVED"
             result = RunResult(
                 final_prompt=fixed_draft.zed_prompt,
                 status="APPROVED",
                 diagnostic_info=diagnostic_info,
             )
-            return _persist_history(result, save_history=save_history, kind="pipeline", task=task, context=context, context_source=context_source, context_truncated=context_truncated, resolved_models={"architect": architect_model, "referee": referee_model}, full_opt_in=full_history_content, history_path=history_path)
+            return _persist_history(result, save_history=save_history, kind="pipeline", task=task, context=context, context_source=context_source, context_truncated=context_truncated, resolved_models={"architect": architect_model, "referee": referee_model}, full_opt_in=full_history_content, history_path=resolved_history_path)
 
         diagnostic_info["status"] = "REJECT"
         diagnostic_info["metrics"] = metrics.to_dict()
-        write_review(diagnostic_info, zed_dir)
+        write_review(diagnostic_info, resolved_zed_dir)
         result = RunResult(final_prompt=None, status="REJECT", diagnostic_info=diagnostic_info)
-        return _persist_history(result, save_history=save_history, kind="pipeline", task=task, context=context, context_source=context_source, context_truncated=context_truncated, resolved_models={"architect": architect_model, "referee": referee_model}, full_opt_in=full_history_content, history_path=history_path)
+        return _persist_history(result, save_history=save_history, kind="pipeline", task=task, context=context, context_source=context_source, context_truncated=context_truncated, resolved_models={"architect": architect_model, "referee": referee_model}, full_opt_in=full_history_content, history_path=resolved_history_path)
 
     except (LLMCallError, JSONRepairError, OSError) as exc:
         diagnostic_info["status"] = "ERROR"
@@ -1149,11 +1183,11 @@ async def run_pipeline(
         # review.md Run Metrics section is not empty if some calls succeeded.
         diagnostic_info["metrics"] = metrics.to_dict()
         try:
-            write_review(diagnostic_info, zed_dir)
+            write_review(diagnostic_info, resolved_zed_dir)
         except OSError:
             pass
         result = RunResult(final_prompt=None, status="ERROR", diagnostic_info=diagnostic_info)
-        return _persist_history(result, save_history=save_history, kind="pipeline", task=task, context=locals().get("context", ""), context_source=locals().get("context_source"), context_truncated=bool(locals().get("context_truncated", False)), resolved_models={"architect": architect_model, "referee": referee_model}, full_opt_in=full_history_content, history_path=history_path)
+        return _persist_history(result, save_history=save_history, kind="pipeline", task=task, context=locals().get("context", ""), context_source=locals().get("context_source"), context_truncated=bool(locals().get("context_truncated", False)), resolved_models={"architect": architect_model, "referee": referee_model}, full_opt_in=full_history_content, history_path=resolved_history_path)
 
 
 _ALLOWED_OUTCOMES: frozenset[str] = frozenset(
