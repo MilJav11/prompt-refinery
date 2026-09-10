@@ -16,6 +16,7 @@ import pytest
 
 import config
 import gui
+import history
 import model_discovery
 import orchestrator
 from orchestrator import RunResult
@@ -731,22 +732,374 @@ class TestExternalOutputValidation:
 
 
 class TestLocalHistoryDisplay:
-    def test_history_detail_is_rendered_as_json_code(self):
+    @staticmethod
+    def _fake_streamlit(selected_index: int = 0):
         fake_st = MagicMock()
-        fake_st.sidebar.selectbox.side_effect = lambda _label, options, **_kwargs: options[0]
-        fake_st.selectbox.side_effect = lambda _label, options, **_kwargs: options[0]
-        fake_st.text_input.side_effect = ["", ""]
-        fake_st.text_area.side_effect = ["", "", ""]
-        fake_st.button.side_effect = [False, False]
-        fake_st.checkbox.return_value = False
-        fake_st.sidebar.expander.return_value = MagicMock()
-        fake_st.spinner.return_value = MagicMock()
-        record = {"run_id": "safe-id", "content": {"external_output": "<script>alert(1)</script>"}}
+        fake_st.selectbox.side_effect = (
+            lambda _label, options, **_kwargs: options[min(selected_index, len(options) - 1)]
+        )
+        fake_st.expander.return_value = MagicMock()
+        return fake_st
+
+    @staticmethod
+    def _record(**overrides):
+        record = {
+            "run_id": "safe-id",
+            "created_at_utc": "2026-08-21T12:03:00+00:00",
+            "kind": "pipeline",
+            "status": "APPROVED",
+            "content_mode": "metadata_only",
+            "context": {
+                "source": "PROJECT_CONTEXT.md",
+                "sha256": "abc123",
+                "chars_used": 12,
+                "truncated": False,
+            },
+            "resolved_models": {"architect": "auto/coding:free", "referee": "auto/review"},
+            "metrics": {
+                "has_usage": True,
+                "total_prompt_tokens": 10,
+                "total_completion_tokens": 20,
+                "total_tokens": 30,
+                "total_cost_usd": 0.01,
+                "calls": [],
+            },
+        }
+        record.update(overrides)
+        return record
+
+    def test_empty_history_renders_safe_message(self):
+        fake_st = self._fake_streamlit()
         with (
             patch.object(gui, "st", fake_st),
-            patch.object(gui, "_fetch_models_cached", return_value=[]),
-            patch.object(gui.history, "read_recent", return_value=([record], 1)),
+            patch.object(gui.history, "read_recent", return_value=([], 0)),
+        ):
+            gui.render_history_browser()
+        fake_st.caption.assert_called_with("No local validation history is available.")
+
+    def test_readable_selector_labels_and_newest_first(self):
+        newer = self._record(run_id="new", created_at_utc="2026-08-21T12:03:00+00:00")
+        older = self._record(run_id="old", created_at_utc="2026-08-21T11:56:00+00:00", status="REJECT")
+        options, _ = gui._history_options([newer, older])
+        assert options[0] == "2026-08-21 12:03 | PIPELINE | APPROVED | auto/coding:free"
+        assert options[1] == "2026-08-21 11:56 | PIPELINE | REJECT | auto/coding:free"
+        assert "new" not in options[0]
+
+    def test_selector_labels_preserve_records_when_natural_suffix_collides(self):
+        first = self._record(run_id="first")
+        natural_suffix = self._record(run_id="natural-suffix")
+        duplicate = self._record(run_id="duplicate")
+        records = [first, natural_suffix, duplicate]
+        with patch.object(
+            gui,
+            "history_selector_label",
+            side_effect=["label", "label (2)", "label"],
+        ):
+            options, by_label = gui._history_options(records)
+
+        assert options == ["label", "label (2)", "label (3)"]
+        assert len(options) == len(records)
+        assert len(by_label) == len(records)
+        assert len(set(options)) == len(records)
+        assert [by_label[option] for option in options] == records
+
+    def test_multiple_runs_switches_selected_detail(self):
+        fake_st = self._fake_streamlit(selected_index=1)
+        newer = self._record(run_id="new")
+        older = self._record(run_id="old", status="REJECT")
+        with (
+            patch.object(gui, "st", fake_st),
+            patch.object(gui.history, "read_recent", return_value=([newer, older], 1)),
+        ):
+            gui.render_history_browser()
+        fake_st.warning.assert_any_call("Skipped 1 malformed history record(s).")
+        fake_st.text.assert_any_call("Run ID: old")
+        fake_st.error.assert_any_call("Status: REJECT")
+
+    def test_metadata_only_shows_explanation_without_content(self):
+        fake_st = self._fake_streamlit()
+        record = self._record()
+        with (
+            patch.object(gui, "st", fake_st),
+            patch.object(gui.history, "read_recent", return_value=([record], 0)),
+        ):
+            gui.render_history_browser()
+        fake_st.info.assert_called_with(
+            "Full task, prompts and outputs were not stored for this metadata-only run."
+        )
+        assert all("safe-id" != str(call) for call in fake_st.code.call_args_list)
+
+    def test_full_pipeline_renders_drafts_reviews_bullets_and_metrics(self):
+        fake_st = self._fake_streamlit()
+        record = self._record(
+            content_mode="full_opt_in",
+            content={
+                "task": "Build feature",
+                "project_context": "Project facts",
+                "drafts": [
+                    {"zed_prompt": "Draft one", "relevant_files": ["gui.py"], "assumptions": ["offline"]},
+                    {"prompt": "Draft two"},
+                ],
+                "reviews": [
+                    {"status": "REJECT", "critique": ["Missing test", ""],
+                     "required_changes": ["Add coverage"], "suggested_prompt": "Fix it"},
+                    {"status": "APPROVED", "critique": ["Looks good"]},
+                ],
+                "reasons": ["Accepted"],
+                "required_changes": ["Keep safety"],
+                "final_prompt": "Final text",
+                "repair_prompt": "Repair text",
+            },
+            metrics={
+                "has_usage": True, "total_prompt_tokens": 10,
+                "total_completion_tokens": 20, "total_tokens": 30,
+                "total_cost_usd": 0.01,
+                "calls": [{"stage": "architect", "model": "auto/coding:free", "prompt_tokens": 4,
+                           "completion_tokens": 6, "total_tokens": 10, "cost_usd": 0.001}],
+            },
+        )
+        with (
+            patch.object(gui, "st", fake_st),
+            patch.object(gui.history, "read_recent", return_value=([record], 0)),
+        ):
+            gui.render_history_browser()
+        expanded = [call.args[0] for call in fake_st.expander.call_args_list]
+        assert expanded == ["Project context", "Draft 1", "Draft 2", "Review 1", "Review 2"]
+        fake_st.text.assert_any_call("• Missing test")
+        fake_st.text.assert_any_call("• Add coverage")
+        fake_st.dataframe.assert_called_once()
+        assert any(call.args == ("Final text",) and call.kwargs["language"] == "text"
+                   for call in fake_st.code.call_args_list)
+
+    def test_approved_external_record_from_production_builder_renders_output_once_as_untrusted_text(self):
+        fake_st = self._fake_streamlit()
+        payload = "<script>alert('not executed')</script>"
+        record = history.build_record(
+            kind="external_validation",
+            status="APPROVED",
+            task="Check output",
+            context="Project facts",
+            context_source="PROJECT_CONTEXT.md",
+            context_truncated=False,
+            diagnostic_info={"metrics": {"has_usage": False}, "reviews": []},
+            resolved_models={"referee": "auto/review"},
+            full_opt_in=True,
+            external_output=payload,
+            final_prompt=payload,
+        )
+        assert record["content"]["final_prompt"] == payload
+        assert record["content"]["external_output"] == payload
+        with (
+            patch.object(gui, "st", fake_st),
+            patch.object(gui.history, "read_recent", return_value=([record], 0)),
+        ):
+            gui.render_history_browser()
+        rendered_subheaders = [call.args[0] for call in fake_st.subheader.call_args_list]
+        rendered_payloads = [call for call in fake_st.code.call_args_list if call.args == (payload,)]
+        assert "Untrusted external agent output" in rendered_subheaders
+        assert "Final prompt" not in rendered_subheaders
+        assert len(rendered_payloads) == 1
+        assert rendered_payloads[0].kwargs == {"language": "text"}
+
+    @pytest.mark.parametrize(
+        ("value", "expected"),
+        [(None, "Not available"), ("not a number", "Not available"), (True, "Not available"), (0, 0)],
+    )
+    def test_history_metric_values_distinguish_unavailable_from_zero(self, value, expected):
+        fake_st = self._fake_streamlit()
+        record = self._record(
+            metrics={
+                "has_usage": True,
+                "total_prompt_tokens": value,
+                "total_completion_tokens": value,
+                "total_tokens": value,
+                "total_cost_usd": value,
+                "calls": [{
+                    "stage": "review",
+                    "model": "auto/review",
+                    "prompt_tokens": value,
+                    "completion_tokens": value,
+                    "total_tokens": value,
+                    "cost_usd": value,
+                }],
+            },
+        )
+        with (
+            patch.object(gui, "st", fake_st),
+            patch.object(gui.history, "read_recent", return_value=([record], 0)),
+        ):
+            gui.render_history_browser()
+
+        totals = fake_st.table.call_args_list[-1].args[0]
+        calls = fake_st.dataframe.call_args.args[0]
+        rendered_text = [call.args[0] for call in fake_st.text.call_args_list]
+        assert f"Total tokens: {expected}" in rendered_text
+        assert f"Estimated cost: {expected}" in rendered_text
+        assert {row["Value"] for row in totals} == {expected}
+        numeric_values = {
+            row[field]
+            for row in calls
+            for field in ("Prompt tokens", "Completion tokens", "Total tokens", "Cost")
+        }
+        assert numeric_values == {expected}
+
+    def test_markdown_bearing_history_content_uses_only_inert_text_or_code(self):
+        fake_st = self._fake_streamlit()
+        payload = "[link](https://example.invalid) ![image](https://example.invalid/x.png) <script>x</script>"
+        record = self._record(
+            content_mode="full_opt_in",
+            content={
+                "task": payload,
+                "project_context": payload,
+                "drafts": [{
+                    "zed_prompt": payload,
+                    "relevant_files": [payload],
+                    "assumptions": [payload],
+                }],
+                "reviews": [{
+                    "status": payload,
+                    "critique": [payload],
+                    "required_changes": [payload],
+                    "suggested_prompt": payload,
+                }],
+                "reasons": [payload],
+                "required_changes": [payload],
+                "final_prompt": payload,
+                "repair_prompt": payload,
+                "external_output": payload,
+            },
+        )
+        with (
+            patch.object(gui, "st", fake_st),
+            patch.object(gui.history, "read_recent", return_value=([record], 0)),
+        ):
+            gui.render_history_browser()
+
+        fake_st.markdown.assert_not_called()
+        fake_st.code.assert_any_call(payload, language="text")
+        rendered_text = [call.args[0] for call in fake_st.text.call_args_list]
+        assert rendered_text.count(f"• {payload}") >= 5
+        assert f"Status: {payload}" in rendered_text
+
+    def test_usage_unavailable_and_missing_optional_fields_are_safe(self):
+        fake_st = self._fake_streamlit()
+        incomplete = {"run_id": "old", "content_mode": "full_opt_in", "metrics": {"has_usage": False}}
+        with (
+            patch.object(gui, "st", fake_st),
+            patch.object(gui.history, "read_recent", return_value=([incomplete], 0)),
+        ):
+            gui.render_history_browser()
+        fake_st.caption.assert_any_call("No full-content details are available for this historical run.")
+        fake_st.caption.assert_any_call("Usage data unavailable.")
+
+    def test_context_evidence_fields_are_shown(self):
+        fake_st = self._fake_streamlit()
+        with (
+            patch.object(gui, "st", fake_st),
+            patch.object(gui.history, "read_recent", return_value=([self._record()], 0)),
+        ):
+            gui.render_history_browser()
+        rendered_text = [call.args[0] for call in fake_st.text.call_args_list]
+        assert "Source: PROJECT_CONTEXT.md" in rendered_text
+        assert "SHA-256: abc123" in rendered_text
+        assert "Chars used: 12" in rendered_text
+        assert "Truncated: False" in rendered_text
+
+    def test_markdown_bearing_history_metadata_uses_only_inert_plain_text(self):
+        fake_st = self._fake_streamlit()
+        link = "[link](https://example.invalid)"
+        image = "![image](https://example.invalid/x.png)"
+        script = "<script>x</script>"
+        record = self._record(
+            run_id=link,
+            created_at_utc=image,
+            kind=script,
+            content_mode=link,
+            resolved_models={"architect": image, "referee": script},
+            context={
+                "source": link,
+                "sha256": image,
+                "chars_used": 12,
+                "truncated": False,
+            },
+            metrics={
+                "has_usage": True,
+                "total_prompt_tokens": 10,
+                "total_completion_tokens": 20,
+                "total_tokens": 30,
+                "total_cost_usd": 0.01,
+                "calls": [{"stage": script, "model": link, "prompt_tokens": 1,
+                           "completion_tokens": 2, "total_tokens": 3, "cost_usd": 0}],
+            },
+        )
+        with (
+            patch.object(gui, "st", fake_st),
+            patch.object(gui.history, "read_recent", return_value=([record], 0)),
+        ):
+            gui.render_history_browser()
+
+        rendered_text = [call.args[0] for call in fake_st.text.call_args_list]
+        assert f"Run ID: {link}" in rendered_text
+        assert f"Created at: {image}" in rendered_text
+        assert f"Run type: {script}" in rendered_text
+        assert f"Content mode: {link}" in rendered_text
+        assert f"Architect model: {image}" in rendered_text
+        assert f"Referee model: {script}" in rendered_text
+        assert f"Context source: {link}" in rendered_text
+        assert f"Source: {link}" in rendered_text
+        assert f"SHA-256: {image}" in rendered_text
+        assert f"Stage: {script}" in rendered_text
+        assert f"Model: {link}" in rendered_text
+        persisted_values = (link, image, script)
+        dynamic_sinks = (
+            fake_st.markdown,
+            fake_st.table,
+            fake_st.dataframe,
+            fake_st.write,
+            fake_st.success,
+            fake_st.error,
+            fake_st.warning,
+            fake_st.info,
+            fake_st.caption,
+            fake_st.header,
+            fake_st.subheader,
+        )
+        for component in dynamic_sinks:
+            assert all(
+                value not in str(call)
+                for call in component.call_args_list
+                for value in persisted_values
+            )
+
+    def test_history_browser_is_read_only(self):
+        fake_st = self._fake_streamlit()
+        reader = MagicMock(return_value=([self._record()], 0))
+        with (
+            patch.object(gui, "st", fake_st),
+            patch.object(gui.history, "read_recent", reader),
+            patch.object(gui.history, "append_record") as append_record,
+            patch.object(gui, "run_pipeline_sync") as pipeline,
+            patch.object(gui, "run_external_validation_sync") as external,
+            patch.object(gui, "_fetch_models_cached") as fetch_models,
+        ):
+            gui.render_history_browser()
+        reader.assert_called_once_with(limit=20)
+        append_record.assert_not_called()
+        pipeline.assert_not_called()
+        external.assert_not_called()
+        fetch_models.assert_not_called()
+
+    def test_history_view_skips_network_and_workflow_actions(self):
+        fake_st = self._fake_streamlit()
+        fake_st.sidebar.radio.return_value = "History Browser"
+        with (
+            patch.object(gui, "st", fake_st),
+            patch.object(gui.history, "read_recent", return_value=([self._record()], 0)),
+            patch.object(gui, "_fetch_models_cached") as fetch_models,
+            patch.object(gui, "run_pipeline_sync") as pipeline,
+            patch.object(gui, "run_external_validation_sync") as external,
         ):
             gui.render_app()
-        fake_st.code.assert_called_with(json.dumps(record, ensure_ascii=False, indent=2), language="json")
-        fake_st.warning.assert_any_call("Skipped 1 malformed history record(s).")
+        fetch_models.assert_not_called()
+        pipeline.assert_not_called()
+        external.assert_not_called()

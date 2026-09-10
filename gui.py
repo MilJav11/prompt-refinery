@@ -7,7 +7,7 @@ Run locally via:
 from __future__ import annotations
 
 import asyncio
-import json
+from datetime import datetime
 import streamlit as st
 
 import config
@@ -128,6 +128,262 @@ def format_markdown_bullets(items: object) -> str:
     return "\n".join(bullets)
 
 
+def _inert_bullet_items(items: object) -> list[str]:
+    """Normalise stored list content for text-only bullet rendering.
+
+    History is a display-only view of untrusted persisted values.  This helper
+    deliberately returns individual strings rather than Markdown so callers
+    cannot accidentally turn links, images, or HTML in a stored value into
+    active Streamlit Markdown.
+    """
+    if isinstance(items, str):
+        candidates = [items]
+    elif isinstance(items, (list, tuple)):
+        candidates = items
+    else:
+        candidates = []
+    return [item.strip() for item in candidates if isinstance(item, str) and item.strip()]
+
+
+def _render_inert_bullets(items: object) -> None:
+    """Render stored list entries as individually readable, inert text bullets."""
+    for item in _inert_bullet_items(items):
+        st.text(f"• {item}")
+
+
+def _as_dict(value: object) -> dict:
+    """Return a mapping only when an untrusted history value is a mapping."""
+    return value if isinstance(value, dict) else {}
+
+
+def _text(value: object, default: str = "Not available") -> str:
+    """Return a safe display string without serialising arbitrary objects."""
+    return value.strip() if isinstance(value, str) and value.strip() else default
+
+
+def _number(value: object, default: object = "Not available") -> object:
+    """Keep ordinary numeric values for display and replace malformed values."""
+    return value if isinstance(value, (int, float)) and not isinstance(value, bool) else default
+
+
+def _history_timestamp(value: object) -> str:
+    """Make an ISO timestamp readable while tolerating old or incomplete records."""
+    if not isinstance(value, str) or not value.strip():
+        return "Time unavailable"
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        return parsed.strftime("%Y-%m-%d %H:%M")
+    except ValueError:
+        return value.strip()
+
+
+def history_selector_label(record: object) -> str:
+    """Return the compact, readable label used for a stored history record."""
+    data = _as_dict(record)
+    kind = _text(data.get("kind"), "RUN").upper()
+    kind = {"PIPELINE": "PIPELINE", "EXTERNAL_VALIDATION": "EXTERNAL"}.get(kind, kind)
+    status = _text(data.get("status"), "UNKNOWN").upper()
+    models = _as_dict(data.get("resolved_models"))
+    model = _text(models.get("architect") or models.get("architect_model"), "")
+    if not model:
+        model = _text(models.get("referee") or models.get("referee_model"), "Model unavailable")
+    return f"{_history_timestamp(data.get('created_at_utc'))} | {kind} | {status} | {model}"
+
+
+def _history_options(records: list[dict]) -> tuple[list[str], dict[str, dict]]:
+    """Build unique readable selector labels without hiding the actual record."""
+    options: list[str] = []
+    by_label: dict[str, dict] = {}
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        label = history_selector_label(record)
+        # Identical summaries are possible, and a natural label may already
+        # look like a generated suffix.  Find a free suffix before mapping.
+        unique_label = label
+        suffix = 2
+        while unique_label in by_label:
+            unique_label = f"{label} ({suffix})"
+            suffix += 1
+        options.append(unique_label)
+        by_label[unique_label] = record
+    return options, by_label
+
+
+def _render_history_status(status: object) -> None:
+    """Render verdicts using normal Streamlit status components."""
+    label = _text(status, "UNKNOWN").upper()
+    if label == "APPROVED":
+        st.success("Status: APPROVED")
+    elif label == "REJECT":
+        st.error("Status: REJECT")
+    elif label == "ERROR":
+        st.error("Status: ERROR")
+    else:
+        # Do not interpolate an unknown persisted status into a Markdown-capable
+        # status component.
+        st.warning("Status: UNKNOWN")
+
+
+def _render_history_label_value(label: str, value: object) -> None:
+    """Render a stored value as inert, plain text next to a trusted label."""
+    if isinstance(value, str):
+        display_value = _text(value)
+    elif isinstance(value, (int, float, bool)):
+        display_value = str(value)
+    else:
+        display_value = "Not available"
+    st.text(f"{label}: {display_value}")
+
+
+def _render_inert_section(title: str, value: object) -> None:
+    """Render stored text as inert code, never as executable or unsafe HTML."""
+    text = _text(value, "")
+    if text:
+        st.subheader(title)
+        st.code(text, language="text")
+
+
+def _render_history_metrics(metrics_value: object) -> None:
+    metrics = _as_dict(metrics_value)
+    st.subheader("Metrics")
+    if not metrics.get("has_usage"):
+        st.caption("Usage data unavailable.")
+        return
+    totals = [
+        ("Total prompt tokens", _number(metrics.get("total_prompt_tokens"))),
+        ("Total completion tokens", _number(metrics.get("total_completion_tokens"))),
+        ("Total tokens", _number(metrics.get("total_tokens"))),
+        ("Total cost USD", _number(metrics.get("total_cost_usd"))),
+    ]
+    st.table([{ "Metric": name, "Value": value } for name, value in totals])
+    calls = metrics.get("calls")
+    if isinstance(calls, list) and calls:
+        rows = []
+        for call in calls:
+            item = _as_dict(call)
+            if item:
+                # Stage and model names originate in saved history.  Keep them
+                # out of dataframe rendering, which may interpret Markdown.
+                _render_history_label_value("Stage", item.get("stage"))
+                _render_history_label_value("Model", item.get("model"))
+                rows.append({
+                    "Prompt tokens": _number(item.get("prompt_tokens")),
+                    "Completion tokens": _number(item.get("completion_tokens")),
+                    "Total tokens": _number(item.get("total_tokens")),
+                    "Cost": _number(item.get("cost_usd")),
+                })
+        if rows:
+            st.write("Call-level usage")
+            st.dataframe(rows, use_container_width=True, hide_index=True)
+
+
+def _render_history_content(record: dict) -> None:
+    """Render optional full history content defensively and read-only."""
+    if record.get("content_mode") != "full_opt_in":
+        st.info("Full task, prompts and outputs were not stored for this metadata-only run.")
+        return
+    content = _as_dict(record.get("content"))
+    if not content:
+        st.caption("No full-content details are available for this historical run.")
+        return
+    _render_inert_section("Task", content.get("task"))
+    project_context = _text(content.get("project_context"), "")
+    if project_context:
+        with st.expander("Project context"):
+            st.code(project_context, language="text")
+
+    drafts = content.get("drafts")
+    if isinstance(drafts, list):
+        for number, draft in enumerate(drafts, start=1):
+            item = _as_dict(draft)
+            if not item:
+                continue
+            with st.expander(f"Draft {number}"):
+                prompt = item.get("zed_prompt") if _text(item.get("zed_prompt"), "") else item.get("prompt")
+                if _text(prompt, ""):
+                    st.code(_text(prompt, ""), language="text")
+                if _inert_bullet_items(item.get("relevant_files")):
+                    st.write("Relevant files")
+                    _render_inert_bullets(item.get("relevant_files"))
+                if _inert_bullet_items(item.get("assumptions")):
+                    st.write("Assumptions")
+                    _render_inert_bullets(item.get("assumptions"))
+
+    reviews = content.get("reviews")
+    if isinstance(reviews, list):
+        for number, review in enumerate(reviews, start=1):
+            item = _as_dict(review)
+            if not item:
+                continue
+            with st.expander(f"Review {number}"):
+                st.text(f"Status: {_text(item.get('status'))}")
+                if _inert_bullet_items(item.get("critique")):
+                    st.write("Critique")
+                    _render_inert_bullets(item.get("critique"))
+                if _inert_bullet_items(item.get("required_changes")):
+                    st.write("Required changes")
+                    _render_inert_bullets(item.get("required_changes"))
+                suggested = _text(item.get("suggested_prompt"), "")
+                if suggested:
+                    st.write("Suggested prompt")
+                    st.code(suggested, language="text")
+
+    for title, key in (
+        ("Reasons", "reasons"),
+        ("Required changes", "required_changes"),
+    ):
+        if _inert_bullet_items(content.get(key)):
+            st.subheader(title)
+            _render_inert_bullets(content.get(key))
+    if record.get("kind") != "external_validation":
+        _render_inert_section("Final prompt", content.get("final_prompt"))
+    _render_inert_section("Repair prompt", content.get("repair_prompt"))
+    external_output = _text(content.get("external_output"), "")
+    if external_output:
+        st.subheader("Untrusted external agent output")
+        st.code(external_output, language="text")
+
+
+def render_history_browser() -> None:
+    """Render local history as a strictly read-only consumer of ``read_recent``."""
+    st.divider()
+    st.header("Local validation history")
+    records, skipped = history.read_recent(limit=20)
+    if skipped:
+        st.warning(f"Skipped {skipped} malformed history record(s).")
+    options, by_label = _history_options(records if isinstance(records, list) else [])
+    if not options:
+        st.caption("No local validation history is available.")
+        return
+
+    selected_label = st.selectbox("History run", options)
+    record = by_label[selected_label]
+    context = _as_dict(record.get("context"))
+    models = _as_dict(record.get("resolved_models"))
+    st.subheader("Run summary")
+    _render_history_status(record.get("status"))
+    _render_history_label_value("Run ID", record.get("run_id"))
+    _render_history_label_value("Created at", _history_timestamp(record.get("created_at_utc")))
+    _render_history_label_value("Run type", record.get("kind"))
+    _render_history_label_value("Content mode", _text(record.get("content_mode"), "metadata_only"))
+    _render_history_label_value("Architect model", models.get("architect") or models.get("architect_model"))
+    _render_history_label_value("Referee model", models.get("referee") or models.get("referee_model"))
+    _render_history_label_value("Total tokens", _number(_as_dict(record.get("metrics")).get("total_tokens")))
+    _render_history_label_value("Estimated cost", _number(_as_dict(record.get("metrics")).get("total_cost_usd")))
+    _render_history_label_value("Context source", context.get("source"))
+    st.subheader("Context evidence")
+    _render_history_label_value("Source", context.get("source"))
+    _render_history_label_value("SHA-256", context.get("sha256"))
+    _render_history_label_value("Chars used", _number(context.get("chars_used"), 0))
+    _render_history_label_value(
+        "Truncated",
+        context.get("truncated") if isinstance(context.get("truncated"), bool) else "Not available",
+    )
+    _render_history_content(record)
+    _render_history_metrics(record.get("metrics"))
+
+
 @st.cache_data(ttl=60, show_spinner=False)
 def _fetch_models_cached(api_base: str | None, api_key: str | None) -> list[str]:
     """Cached wrapper for :func:`model_discovery.fetch_available_models`.
@@ -219,6 +475,13 @@ def _render_model_field(
 def render_app() -> None:
     """Render the Streamlit user interface."""
     st.set_page_config(page_title="Prompt Refinery (VCF)", layout="wide", page_icon="⚡")
+
+    # Keeping history in its own view makes selecting a saved run a true
+    # read-only path: no model discovery, agent orchestration, or context load.
+    view = st.sidebar.radio("View", ("Refine Prompt", "History Browser"))
+    if view == "History Browser":
+        render_history_browser()
+        return
 
     # --- Sidebar / Controls ---
     st.sidebar.header("⚙️ Configuration")
@@ -467,18 +730,6 @@ def render_app() -> None:
         st.subheader("Repair prompt")
         st.code(repair_prompt or "No repair prompt required.", language="markdown")
 
-    st.divider()
-    st.header("Local validation history")
-    records, skipped = history.read_recent()
-    if skipped:
-        st.warning(f"Skipped {skipped} malformed history record(s).")
-    if not records:
-        st.caption("No local validation history is available.")
-    else:
-        by_id = {str(record.get("run_id", "unknown")): record for record in records}
-        selected_id = st.selectbox("History run ID", list(by_id))
-        # JSON code rendering is plain text; untrusted record content is never HTML.
-        st.code(json.dumps(by_id[selected_id], ensure_ascii=False, indent=2), language="json")
 
 
 def main() -> None:
