@@ -72,7 +72,8 @@ async def refine_prompt(
     architect_model: str | None = None,
     referee_model: str | None = None,
     timeout: float | None = None,
-    context_dir: str = ".",
+    context_dir: str | None = None,
+    project_root: str | None = None,
     preset: str | None = None,
 ) -> dict[str, Any]:
     """Refine a raw task description into a validated, structured prompt for an AI IDE agent.
@@ -101,9 +102,11 @@ async def refine_prompt(
         Per-call LLM timeout in seconds.  Defaults to the
         ``VCF_REQUEST_TIMEOUT`` environment variable (fallback: ``60``).
     context_dir:
-        Directory from which to load project context (``PROJECT_CONTEXT.md``
-        or ``docs/MEMORY.md``).  Defaults to ``"."`` (current working
-        directory).
+        Legacy compatibility alias for ``project_root``.  If explicitly
+        supplied with a different ``project_root``, the request fails safely.
+    project_root:
+        Canonical project directory. Context, default prompt/review artifacts,
+        and validation history are all resolved under this directory.
     preset:
         Optional model preset shortcut.  Available presets:
 
@@ -146,7 +149,19 @@ async def refine_prompt(
     """
     _log.info("refine_prompt called: task=%r", task[:120])
 
-    zed_dir = Path(config.ZED_DIR)
+    try:
+        project_paths = config.resolve_project_paths(
+            project_root=project_root,
+            context_dir=context_dir,
+        )
+    except config.ProjectRootError as exc:
+        return {
+            "status": "ERROR",
+            "final_prompt": None,
+            "summary": "[VCF] Tokens used: unavailable",
+            "details_path": None,
+            "error": str(exc),
+        }
 
     try:
         result = await run_pipeline(
@@ -154,9 +169,8 @@ async def refine_prompt(
             architect_model=architect_model,
             referee_model=referee_model,
             timeout=timeout,
-            context_dir=context_dir,
-            zed_dir=zed_dir,
             preset=preset,
+            project_paths=project_paths,
         )
     except Exception as exc:  # noqa: BLE001 — safety net; run_pipeline already handles most
         # Catch any unexpected exception that escaped run_pipeline's own
@@ -167,7 +181,7 @@ async def refine_prompt(
             "status": "ERROR",
             "final_prompt": None,
             "summary": "[VCF] Tokens used: unavailable",
-            "details_path": str(zed_dir / "review.md"),
+            "details_path": str(project_paths.artifact_dir / "review.md"),
             "error": error_msg,
         }
 
@@ -176,9 +190,9 @@ async def refine_prompt(
 
     # Determine which output file was written.
     if result.status == "APPROVED":
-        details_path = str(zed_dir / "prompt.md")
+        details_path = str(project_paths.artifact_dir / "prompt.md")
     else:
-        details_path = str(zed_dir / "review.md")
+        details_path = str(project_paths.artifact_dir / "review.md")
 
     error_msg: str | None = None
     if result.status == "ERROR":

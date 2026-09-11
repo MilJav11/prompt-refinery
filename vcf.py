@@ -48,6 +48,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Per-call LLM timeout in seconds (defaults to VCF_REQUEST_TIMEOUT from .env)",
     )
     parser.add_argument(
+        "--project-root",
+        default=None,
+        help=(
+            "Canonical project directory. Relative paths are resolved from the "
+            "application startup directory. Defaults to VCF_PROJECT_ROOT or startup directory."
+        ),
+    )
+    parser.add_argument(
         "--preset",
         "-p",
         default=None,
@@ -64,10 +72,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     # Imported lazily so that argparse errors (bad CLI args) don't require
     # network/config-capable modules to import successfully first.
+    import config
     from orchestrator import format_metrics_summary, run_pipeline
 
     parser = build_arg_parser()
     args = parser.parse_args(argv)
+
+    try:
+        project_paths = config.resolve_project_paths(project_root=args.project_root)
+    except config.ProjectRootError as exc:
+        print(f"vcf.py: {exc}", file=sys.stderr)
+        return 1
 
     try:
         result = asyncio.run(
@@ -77,6 +92,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 referee_model=args.referee_model,
                 timeout=args.timeout,
                 preset=args.preset,
+                project_paths=project_paths,
             )
         )
     except Exception as exc:  # last-resort safety net: never leak a raw traceback
@@ -85,22 +101,24 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     # Print the token/cost summary unconditionally, regardless of outcome.
     print(format_metrics_summary(result.diagnostic_info))
+    print(f"Project root: {project_paths.root}")
+    print(f"Artifacts: {project_paths.artifact_dir}")
 
     if result.status == "APPROVED":
-        print("Prompt approved and written to .zed/prompt.md")
+        print(f"Prompt approved and written to {project_paths.artifact_dir / 'prompt.md'}")
         return 0
 
     if result.status == "REJECT":
         print(
             "Prompt was rejected by the Referee after one fix attempt. "
-            "See .zed/review.md for details.",
+            f"See {project_paths.artifact_dir / 'review.md'} for details.",
             file=sys.stderr,
         )
         return 1
 
     print(
         f"vcf.py failed: {result.diagnostic_info.get('error', 'unknown error')}. "
-        "See .zed/review.md for details.",
+        f"See {project_paths.artifact_dir / 'review.md'} for details.",
         file=sys.stderr,
     )
     return 1

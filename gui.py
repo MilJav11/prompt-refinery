@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 from datetime import datetime
+from pathlib import Path
 import streamlit as st
 
 import config
@@ -49,18 +50,27 @@ def run_pipeline_sync(
     referee_model: str | None = None,
     save_history: bool = False,
     full_history_content: bool = False,
+    project_root: str | Path | None = None,
+    project_paths: config.ProjectPaths | None = None,
 ) -> RunResult:
     """Synchronously run orchestrator.run_pipeline using asyncio.run."""
-    return asyncio.run(
-        orchestrator.run_pipeline(
+    kwargs = dict(
             task=task,
             preset=preset,
             architect_model=architect_model,
             referee_model=referee_model,
             save_history=save_history,
             full_history_content=full_history_content,
-        )
     )
+    if project_paths is not None:
+        if project_root is not None:
+            raise config.ProjectRootError("project_paths cannot be combined with project_root")
+        kwargs["project_paths"] = project_paths
+    elif project_root is not None:
+        # Compatibility for callers of this low-level GUI wrapper. The normal
+        # UI path passes its already-selected immutable project scope.
+        kwargs["project_paths"] = config.resolve_project_paths(project_root=project_root)
+    return asyncio.run(orchestrator.run_pipeline(**kwargs))
 
 
 def run_external_validation_sync(
@@ -73,10 +83,10 @@ def run_external_validation_sync(
     full_history_content: bool = False,
     context_source: str | None = None,
     context_truncated: bool = False,
+    history_path: str | Path | None = None,
 ) -> RunResult:
     """Synchronously validate untrusted external output with the Referee only."""
-    return asyncio.run(
-        orchestrator.validate_external_output(
+    kwargs = dict(
             task=task,
             project_context=project_context,
             external_output=external_output,
@@ -86,8 +96,63 @@ def run_external_validation_sync(
             full_history_content=full_history_content,
             context_source=context_source,
             context_truncated=context_truncated,
-        )
     )
+    if history_path is not None:
+        kwargs["history_path"] = history_path
+    return asyncio.run(orchestrator.validate_external_output(**kwargs))
+
+
+def _active_project_paths() -> config.ProjectPaths:
+    """Reuse the immutable session scope; resolve only on initial activation."""
+    state = st.session_state
+    paths = state.get("active_project_paths")
+    if isinstance(paths, config.ProjectPaths):
+        return paths
+    selected = state.get("active_project_root")
+    paths = config.resolve_project_paths(
+        project_root=selected if isinstance(selected, (str, Path)) else None
+    )
+    state["active_project_paths"] = paths
+    state["active_project_root"] = str(paths.root)
+    return paths
+
+
+def use_project_root(value: str | Path) -> config.ProjectPaths:
+    """Explicitly activate a root and discard state tied to another project."""
+    paths = config.resolve_project_paths(project_root=value)
+    state = st.session_state
+    active = state.get("active_project_paths")
+    previous = str(active.root) if isinstance(active, config.ProjectPaths) else state.get("active_project_root")
+    if previous != str(paths.root):
+        state.pop("history_browser_selection", None)
+        state["_reset_history_browser_selection"] = True
+        for key in (
+            "refine_task",
+            "external_validation_task",
+            "external_validation_output",
+        ):
+            # These are the actual Streamlit widget keys. Assigning their reset
+            # value in the button callback updates both session state and the
+            # visible frontend widgets; deleting the keys lets the browser's
+            # stale widget payload restore the old text on the next rerun.
+            state[key] = ""
+    state["active_project_root"] = str(paths.root)
+    state["active_project_paths"] = paths
+    return paths
+
+
+def _activate_project_root_from_sidebar() -> None:
+    """Activate the edited root before Streamlit rebuilds keyed widgets."""
+    state = st.session_state
+    candidate = state.get("project_root_candidate", "")
+    try:
+        paths = use_project_root(candidate)
+    except config.ProjectRootError as exc:
+        state["project_root_activation_error"] = str(exc)
+        state.pop("project_root_activation_success", None)
+        return
+    state["project_root_activation_success"] = f"Active project: {paths.root}"
+    state.pop("project_root_activation_error", None)
 
 
 def is_model_absent_from_list(model_id: str | None, available: list[str]) -> bool:
@@ -345,11 +410,13 @@ def _render_history_content(record: dict) -> None:
         st.code(external_output, language="text")
 
 
-def render_history_browser() -> None:
+def render_history_browser(project_paths: config.ProjectPaths | None = None) -> None:
     """Render local history as a strictly read-only consumer of ``read_recent``."""
     st.divider()
     st.header("Local validation history")
-    records, skipped = history.read_recent(limit=20)
+    if project_paths is None:
+        project_paths = _active_project_paths()
+    records, skipped = history.read_recent(project_paths.validation_history, limit=20)
     if skipped:
         st.warning(f"Skipped {skipped} malformed history record(s).")
     options, by_label = _history_options(records if isinstance(records, list) else [])
@@ -357,7 +424,9 @@ def render_history_browser() -> None:
         st.caption("No local validation history is available.")
         return
 
-    selected_label = st.selectbox("History run", options)
+    if st.session_state.pop("_reset_history_browser_selection", False):
+        st.session_state["history_browser_selection"] = options[0]
+    selected_label = st.selectbox("History run", options, key="history_browser_selection")
     record = by_label[selected_label]
     context = _as_dict(record.get("context"))
     models = _as_dict(record.get("resolved_models"))
@@ -478,13 +547,31 @@ def render_app() -> None:
 
     # Keeping history in its own view makes selecting a saved run a true
     # read-only path: no model discovery, agent orchestration, or context load.
-    view = st.sidebar.radio("View", ("Refine Prompt", "History Browser"))
-    if view == "History Browser":
-        render_history_browser()
+    try:
+        active_paths = _active_project_paths()
+    except config.ProjectRootError:
+        st.error("The active project root is no longer available. Select a valid project.")
         return
-
+    view = st.sidebar.radio("View", ("Refine Prompt", "History Browser"))
     # --- Sidebar / Controls ---
     st.sidebar.header("⚙️ Configuration")
+    st.sidebar.text_input(
+        "Project root",
+        value=str(active_paths.root),
+        key="project_root_candidate",
+        help="Editing this field does not change the active project until Use project is selected.",
+    )
+    st.sidebar.button("Use project", on_click=_activate_project_root_from_sidebar)
+    activation_error = st.session_state.pop("project_root_activation_error", None)
+    activation_success = st.session_state.pop("project_root_activation_success", None)
+    if activation_error:
+        st.sidebar.error(activation_error)
+    elif activation_success:
+        st.sidebar.success(activation_success)
+    st.sidebar.caption(f"Canonical active root: {active_paths.root}")
+    if view == "History Browser":
+        render_history_browser(active_paths)
+        return
 
     # ------------------------------------------------------------------ #
     # Fetch available models from proxy (cached, 60 s TTL).              #
@@ -583,6 +670,7 @@ def render_app() -> None:
 
     task_input = st.text_area(
         "Enter your task / requirement:",
+        key="refine_task",
         height=150,
         placeholder="e.g. Add exponential backoff retry logic to the HTTP connection handler in orchestrator.py",
     )
@@ -612,6 +700,7 @@ def render_app() -> None:
                     referee_model=referee_model,
                     save_history=save_history,
                     full_history_content=full_history_content,
+                    project_paths=active_paths,
                 )
             except Exception:  # Do not reveal provider or local exception details.
                 st.error("Pipeline could not be completed. Check the configuration and retry.")
@@ -681,7 +770,7 @@ def render_app() -> None:
             st.warning("Enter both the original task and external agent output before validating.")
             return
 
-        project_context, context_source, context_truncated = orchestrator.load_ssot_context_with_evidence()
+        project_context, context_source, context_truncated = orchestrator.load_ssot_context_with_evidence(active_paths)
         with st.spinner("Validating external output with the Referee..."):
             try:
                 external_result = run_external_validation_sync(
@@ -694,6 +783,7 @@ def render_app() -> None:
                     full_history_content=full_history_content,
                     context_source=context_source,
                     context_truncated=context_truncated,
+                    history_path=active_paths.validation_history,
                 )
             except Exception:
                 # Do not surface exception details: provider errors can contain secrets.
