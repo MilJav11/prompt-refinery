@@ -13,12 +13,18 @@ import streamlit as st
 
 import config
 import history
+import memory_capture
 import model_discovery
 import orchestrator
 from orchestrator import RunResult
 
 # Sentinel shown in the model selectbox to let users type a custom ID.
 _CUSTOM_MODEL_OPTION = "[Custom / Manual entry]"
+_CAPTURE_PENDING_KEY = "memory_capture_pending"
+_CAPTURE_OWNER_KEY = "memory_capture_project_root"
+_CAPTURE_SOURCE_KEY = "memory_capture_source"
+_CAPTURE_STATUS_KEY = "memory_capture_status"
+_CAPTURE_SELECTION_PREFIX = "memory_capture_selected_"
 
 
 def parse_model_override(value: str | None) -> str | None:
@@ -126,6 +132,7 @@ def use_project_root(value: str | Path) -> config.ProjectPaths:
     if previous != str(paths.root):
         state.pop("history_browser_selection", None)
         state["_reset_history_browser_selection"] = True
+        clear_memory_capture_state(state)
         for key in (
             "refine_task",
             "external_validation_task",
@@ -139,6 +146,123 @@ def use_project_root(value: str | Path) -> config.ProjectPaths:
     state["active_project_root"] = str(paths.root)
     state["active_project_paths"] = paths
     return paths
+
+
+def clear_memory_capture_state(state: object | None = None) -> None:
+    """Discard all non-persistent capture state when its project changes."""
+    session = st.session_state if state is None else state
+    for key in (_CAPTURE_PENDING_KEY, _CAPTURE_OWNER_KEY, _CAPTURE_SOURCE_KEY, _CAPTURE_STATUS_KEY):
+        session.pop(key, None)
+    for key in list(session):
+        if isinstance(key, str) and key.startswith(_CAPTURE_SELECTION_PREFIX):
+            session.pop(key, None)
+
+
+def _remember_approved_capture_source(
+    project_paths: config.ProjectPaths, task: str, final_prompt: str, result_summary: str | None = None,
+) -> None:
+    """Retain only bounded, current approved workflow state in this session."""
+    st.session_state[_CAPTURE_SOURCE_KEY] = {
+        "project_root": str(project_paths.root),
+        "task": task[:memory_capture.MAX_TASK_CHARS],
+        "final_prompt": final_prompt[:memory_capture.MAX_FINAL_PROMPT_CHARS],
+        "result_summary": (result_summary or "")[:memory_capture.MAX_RESULT_SUMMARY_CHARS],
+    }
+
+
+def generate_memory_candidates_sync(
+    source: dict[str, str], preset: str | None, referee_model: str | None,
+) -> list[dict[str, str]]:
+    """Use the existing resolved Referee/provider path for the explicit capture action."""
+    _, model = config.resolve_models(preset=preset, referee_model=referee_model)
+    return asyncio.run(memory_capture.generate_candidates(
+        task=source["task"], final_prompt=source["final_prompt"],
+        result_summary=source.get("result_summary"), model=model,
+    ))
+
+
+def _capture_source_for(project_paths: config.ProjectPaths) -> dict[str, str] | None:
+    source = st.session_state.get(_CAPTURE_SOURCE_KEY)
+    if not isinstance(source, dict) or source.get("project_root") != str(project_paths.root):
+        return None
+    task, final_prompt = source.get("task"), source.get("final_prompt")
+    if not isinstance(task, str) or not isinstance(final_prompt, str):
+        return None
+    return source
+
+
+def render_memory_capture(
+    project_paths: config.ProjectPaths, preset: str | None, referee_model: str | None,
+) -> None:
+    """Render explicit capture, review, and approval controls without background work."""
+    source = _capture_source_for(project_paths)
+    if source is None:
+        return
+
+    st.divider()
+    st.subheader("Retain Project Knowledge")
+    st.caption("Generate proposals from this approved result, then explicitly save selected items.")
+    status = st.session_state.get(_CAPTURE_STATUS_KEY)
+    if status:
+        level, message = status
+        getattr(st, level)(message)
+
+    if st.button("Retain Project Knowledge"):
+        try:
+            with st.spinner("Generating memory candidates..."):
+                candidates = generate_memory_candidates_sync(source, preset, referee_model)
+        except Exception:
+            # Provider and parsing details can expose sensitive configuration.
+            message = "Could not generate memory candidates. Previous candidates were kept."
+            st.session_state[_CAPTURE_STATUS_KEY] = ("error", message)
+            st.error(message)
+        else:
+            # Replacement occurs only after a complete batch has validated.
+            for key in list(st.session_state):
+                if isinstance(key, str) and key.startswith(_CAPTURE_SELECTION_PREFIX):
+                    st.session_state.pop(key, None)
+            st.session_state[_CAPTURE_PENDING_KEY] = candidates
+            st.session_state[_CAPTURE_OWNER_KEY] = str(project_paths.root)
+            for index in range(len(candidates)):
+                st.session_state[f"{_CAPTURE_SELECTION_PREFIX}{index}"] = True
+            message = "Memory candidates are ready for review."
+            st.session_state[_CAPTURE_STATUS_KEY] = ("success", message)
+            st.success(message)
+
+    pending = st.session_state.get(_CAPTURE_PENDING_KEY)
+    owner = st.session_state.get(_CAPTURE_OWNER_KEY)
+    if not isinstance(pending, list) or owner != str(project_paths.root):
+        return
+
+    st.caption("Select the candidates you approve. Generating or changing selection writes nothing.")
+    for index, candidate in enumerate(pending):
+        if not isinstance(candidate, dict):
+            continue
+        st.checkbox(
+            f"[{candidate.get('category', '')}] {candidate.get('content', '')}",
+            key=f"{_CAPTURE_SELECTION_PREFIX}{index}",
+        )
+    if st.button("Save Selected Knowledge"):
+        selected = [
+            candidate for index, candidate in enumerate(pending)
+            if st.session_state.get(f"{_CAPTURE_SELECTION_PREFIX}{index}", False)
+        ]
+        if not selected:
+            message = "No memory candidates selected; nothing was saved."
+            st.session_state[_CAPTURE_STATUS_KEY] = ("warning", message)
+            st.warning(message)
+        else:
+            try:
+                saved = memory_capture.save_selected(project_paths, selected)
+            except Exception:
+                message = "Selected knowledge could not be saved. Review it and retry."
+                st.session_state[_CAPTURE_STATUS_KEY] = ("error", message)
+                st.error(message)
+            else:
+                clear_memory_capture_state()
+                message = f"Saved {saved} new memory candidate(s); normalized duplicates were not added."
+                st.session_state[_CAPTURE_STATUS_KEY] = ("success", message)
+                st.success(message)
 
 
 def _activate_project_root_from_sidebar() -> None:
@@ -711,6 +835,12 @@ def render_app() -> None:
             st.warning("Validation completed, but local history could not be saved.")
 
         if result.status == "APPROVED":
+            _remember_approved_capture_source(
+                active_paths,
+                clean_task,
+                result.final_prompt or "",
+                orchestrator.format_metrics_summary(result.diagnostic_info),
+            )
             st.success("Prompt successfully generated and verified!")
             st.subheader("Approved Zed Prompt")
             st.code(result.final_prompt or "", language="markdown")
@@ -743,6 +873,7 @@ def render_app() -> None:
             # tracebacks, so this branch deliberately renders no diagnostics.
             st.error("Pipeline could not be completed. Check the configuration and retry.")
 
+    render_memory_capture(active_paths, selected_preset, referee_model)
 
     # --- Independent external-output validation ---
     st.divider()
