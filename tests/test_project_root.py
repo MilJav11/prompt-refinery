@@ -156,7 +156,7 @@ def test_pipeline_from_a_targets_b_for_context_artifacts_and_history(tmp_path: P
     prompt = "\n\n".join(section + "\nTest B" for section in orchestrator.REQUIRED_PROMPT_SECTIONS)
 
     async def architect(task, context, *_args, **_kwargs):
-        assert context == "context B"
+        assert context == "=== Project Context (primary) ===\ncontext B"
         return ArchitectDraft(zed_prompt=prompt, relevant_files=[], assumptions=[]), []
 
     async def review(*_args, **_kwargs):
@@ -469,11 +469,11 @@ review = AsyncMock(return_value=(RefereeReview(status="APPROVED", critique=[], r
 with patch.object(orchestrator, "run_architect", architect), patch.object(orchestrator, "_review_with_contract_gate", review):
     result = asyncio.run(orchestrator.run_pipeline("task", project_root=root, save_history=True))
 assert result.status == "APPROVED", result.diagnostic_info
-assert architect.await_args.args[1] == "context B"
+assert architect.await_args.args[1] == "=== Project Context (primary) ===\ncontext B"
 assert (root / ".zed" / "prompt.md").read_text(encoding="utf-8") == prompt
 records, skipped = history.read_recent(root / ".zed" / "validation_history.jsonl")
 assert len(records) == 1 and skipped == 0
-assert records[0]["context"] == history.context_evidence("context B", "PROJECT_CONTEXT.md", False)
+assert records[0]["context"] == history.context_evidence("=== Project Context (primary) ===\ncontext B", "PROJECT_CONTEXT.md", False)
 assert not (Path.cwd() / ".zed").exists()
 assert not network_attempts, network_attempts
 print("Child offline audit: 0 outbound network attempts; B context, artifacts and history verified")

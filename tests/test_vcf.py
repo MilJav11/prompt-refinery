@@ -490,7 +490,7 @@ class TestSsotContext:
         context = orchestrator.load_ssot_context(tmp_path, max_chars=6000)
 
         assert len(context) == 6000
-        assert context == "A" * 6000
+        assert context.startswith("=== Project Context (primary) ===\n")
 
     def test_falls_back_to_docs_memory(self, tmp_path):
         docs = tmp_path / "docs"
@@ -499,7 +499,7 @@ class TestSsotContext:
 
         context = orchestrator.load_ssot_context(tmp_path, max_chars=6000)
 
-        assert context == "memory content"
+        assert context == "=== Legacy Project Memory (supplemental) ===\nmemory content"
 
     def test_no_context_file_returns_empty_string(self, tmp_path):
         context = orchestrator.load_ssot_context(tmp_path, max_chars=6000)
@@ -513,7 +513,8 @@ class TestSsotContext:
 
         context = orchestrator.load_ssot_context(tmp_path, max_chars=6000)
 
-        assert context == "primary"
+        assert "=== Project Context (primary) ===\nprimary" in context
+        assert "=== Legacy Project Memory (supplemental) ===\nsecondary" in context
 
 
 class TestCli:
@@ -839,7 +840,8 @@ class TestPromptContractEnforcement:
         ]
         assert len(referee_messages) == 2
         contents = [messages[1]["content"] for messages in referee_messages]
-        expected_prefix = f"Original user task:\n{task}\n\nProject context:\n{context}\n\n"
+        expected_context = f"=== Project Context (primary) ===\n{context}"
+        expected_prefix = f"Original user task:\n{task}\n\nProject context:\n{expected_context}\n\n"
         assert all(content.startswith(expected_prefix) for content in contents)
         assert all("Architect draft (JSON):\n" in content for content in contents)
         assert json.loads(contents[0].split("Architect draft (JSON):\n", 1)[1])["zed_prompt"] == first_prompt

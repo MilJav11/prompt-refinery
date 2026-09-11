@@ -20,6 +20,7 @@ from pydantic import BaseModel, ValidationError
 
 import config
 import history
+import memory
 from schemas import ArchitectDraft, RefereeReview, RunResult
 
 
@@ -377,33 +378,16 @@ def load_ssot_context(
     base_dir: str | Path | config.ProjectPaths = ".",
     max_chars: int = config.CONTEXT_MAX_CHARS,
 ) -> str:
-    """Load up to ``max_chars`` characters from the first SSOT context file found.
-
-    Checks ``PROJECT_CONTEXT.md`` then ``docs/MEMORY.md`` (relative to
-    ``base_dir``). Returns an empty string if neither file exists or is
-    readable.
-    """
+    """Load composed, budgeted project knowledge from the canonical project."""
     context, _, _ = load_ssot_context_with_evidence(base_dir, max_chars)
     return context
 
 
 def load_ssot_context_with_evidence(base_dir: str | Path | config.ProjectPaths = ".", max_chars: int = config.CONTEXT_MAX_CHARS) -> tuple[str, str | None, bool]:
-    """Load context with its winning source and truncation fact, preserving priority."""
-    if isinstance(base_dir, config.ProjectPaths):
-        candidates = (
-            ("PROJECT_CONTEXT.md", base_dir.project_context),
-            ("docs/MEMORY.md", base_dir.legacy_memory),
-        )
-    else:
-        candidates = tuple((relative, Path(base_dir) / relative) for relative in config.CONTEXT_FILENAMES)
-    for relative, candidate in candidates:
-        if candidate.is_file():
-            try:
-                text = candidate.read_text(encoding="utf-8", errors="replace")
-            except OSError:
-                continue
-            return text[:max_chars], str(relative).replace("\\", "/"), len(text) > max_chars
-    return "", None, False
+    """Load additive knowledge and stable source evidence without writing files."""
+    project_paths = base_dir if isinstance(base_dir, config.ProjectPaths) else config.ProjectPaths.from_root(Path(base_dir).resolve())
+    context, sources, truncated = memory.compose_project_knowledge(project_paths, max_chars)
+    return context, " + ".join(sources) if sources else None, truncated
 
 
 def _record_history_safely(**kwargs: Any) -> bool:
