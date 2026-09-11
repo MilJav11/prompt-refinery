@@ -429,7 +429,10 @@ def test_real_streamlit_widgets_clear_only_after_use_project(tmp_path, monkeypat
 
     second = _root(tmp_path, "second")
     monkeypatch.setattr(gui.model_discovery, "fetch_available_models", lambda **kwargs: [])
-    app = AppTest.from_file(str(Path(gui.__file__))).run()
+    # AppTest starts a fresh Streamlit script runner.  The capture UI adds an
+    # import-only module on the normal no-capture path, so allow the same
+    # bounded startup budget used by slower Windows CI hosts.
+    app = AppTest.from_file(str(Path(gui.__file__))).run(timeout=5)
     assert not app.exception
     app.text_area(key="refine_task").set_value("old task")
     app.text_area(key="external_validation_task").set_value("old validation task")
