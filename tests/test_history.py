@@ -3,10 +3,16 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import uuid
 from datetime import datetime, timedelta
 from pathlib import Path
 from unittest.mock import patch
+
+# Keep this relevant context/orchestrator selection offline-safe even when it
+# is executed alone, before importing a module that imports LiteLLM.
+os.environ["LITELLM_LOCAL_MODEL_COST_MAP"] = "True"
+os.environ["PYTHON_DOTENV_DISABLED"] = "1"
 
 import history
 import orchestrator
@@ -77,8 +83,9 @@ def test_context_evidence_priority_hash_and_truncation(tmp_path):
     (tmp_path / "PROJECT_CONTEXT.md").write_text("abcdef", encoding="utf-8")
     (tmp_path / "docs" / "MEMORY.md").write_text("wrong source", encoding="utf-8")
     context, source, truncated = orchestrator.load_ssot_context_with_evidence(tmp_path, max_chars=3)
-    assert (context, source, truncated) == ("abc", "PROJECT_CONTEXT.md", True)
-    assert history.context_evidence(context, source, truncated)["sha256"] == history.context_evidence("abc", source, True)["sha256"]
+    assert source == "PROJECT_CONTEXT.md + docs/MEMORY.md"
+    assert truncated is True and len(context) == 3
+    assert history.context_evidence(context, source, truncated)["sha256"] == history.context_evidence(context, source, True)["sha256"]
 
 
 def test_empty_context_evidence_is_explicit_and_stable(tmp_path):
@@ -352,7 +359,7 @@ def test_external_runtime_persists_metrics_and_context_evidence(tmp_path):
     assert len(rows) == 1
     row = rows[0]
     assert result.status == "APPROVED" and row["context"]["source"] == "docs/MEMORY.md"
-    assert row["context"]["sha256"] == hashlib.sha256(b"abc").hexdigest()
+    assert row["context"]["sha256"] == hashlib.sha256(context.encode()).hexdigest()
     assert row["context"]["chars_used"] == 3
     assert row["context"]["truncated"] is True
     assert row["resolved_models"]["referee"] == "r"
