@@ -1,4 +1,27 @@
-# Verified Code Factory (VCF)
+# Prompt Refinery
+
+Verified Code Factory (VCF) – turns raw tasks into validated, contract-checked prompts for AI IDE agents.
+
+[![CI](https://github.com/MilJav11/prompt-refinery/actions/workflows/ci.yml/badge.svg)](https://github.com/MilJav11/prompt-refinery/actions/workflows/ci.yml)
+[![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://www.python.org/downloads/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
+
+## At a glance
+
+VCF runs an Architect → Referee loop that drafts a prompt and validates it before anything is written. Every draft must pass Prompt Contract v1, a strict structural contract that keeps instructions concrete and verifiable. On top of the core pipeline sit an MCP server, a Streamlit GUI, and Zed integration for use inside your editor.
+
+## Quick start
+
+```sh
+python -m venv .venv && source .venv/bin/activate  # Windows: .venv\Scripts\activate
+pip install -r requirements.txt
+cp .env.example .env
+python vcf.py "Add retry logic to the connection handler"
+streamlit run gui.py
+python -m pytest -q   # tests run offline — no API key needed
+```
+
+---
 
 A **stateless artifact pipeline** that translates raw task descriptions into validated, structured prompts for AI IDE agents. VCF enforces a strict Prompt Contract that ensures every instruction is concrete, implementable, and verifiable.
 
