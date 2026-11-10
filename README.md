@@ -1,6 +1,29 @@
-# Verified Code Factory (VCF)
+# Prompt Refinery
 
-A **stateless artifact pipeline** that translates raw task descriptions into validated, structured prompts for AI IDE agents. VCF enforces a strict Prompt Contract that ensures every instruction is concrete, implementable, and verifiable.
+Verified Code Factory (VCF) – turns raw tasks into validated, contract-checked prompts for AI IDE agents.
+
+[![CI](https://github.com/MilJav11/prompt-refinery/actions/workflows/ci.yml/badge.svg)](https://github.com/MilJav11/prompt-refinery/actions/workflows/ci.yml)
+[![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://www.python.org/downloads/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
+
+## At a glance
+
+VCF runs an Architect → Referee loop that drafts a prompt and validates it before anything is written. Every draft must pass Prompt Contract v1, a strict structural contract that keeps instructions concrete and verifiable. On top of the core pipeline sit an MCP server, a Streamlit GUI, and Zed integration for use inside your editor. VCF is a **stateless artifact pipeline**: every instruction it produces is concrete, implementable, and verifiable.
+
+## Quick start
+
+Requires Python 3.11+.
+
+```sh
+python -m venv .venv && source .venv/bin/activate  # Windows: .venv\Scripts\activate
+pip install -r requirements.txt
+cp .env.example .env   # then add your provider API key and model names (see docs/REFERENCE.md)
+python vcf.py "Add retry logic to the connection handler"   # writes .zed/prompt.md
+streamlit run gui.py                                       # http://localhost:8501
+python -m pytest -q   # tests run offline — no API key needed
+```
+
+![Prompt Refinery GUI](docs/assets/gui.png)
 
 ---
 
@@ -94,227 +117,6 @@ Every approved `zed_prompt` must contain exactly four top-level Markdown section
 
 ---
 
-## Installation & Setup
-
-### 1. Clone and Install Dependencies
-
-```sh
-pip install -r requirements.txt
-```
-
-### 2. Configure Environment
-
-Copy the example environment file:
-
-```sh
-cp .env.example .env
-```
-
-Then edit `.env` with your actual API keys and model choices. See `.env.example` for configuration templates:
-
-```dotenv
-# Example: OpenRouter with Gemini 2.5 Flash Lite (recommended for smoke testing)
-OPENROUTER_API_KEY=your-openrouter-api-key
-VCF_API_PROVIDER=default
-VCF_ARCHITECT_MODEL=openrouter/google/gemini-2.5-flash-lite
-VCF_REFEREE_MODEL=openrouter/google/gemini-2.5-flash-lite
-VCF_REQUEST_TIMEOUT=60
-```
-
-**⚠️ Never commit a real `.env` file.** Only `.env.example` (with placeholders) is tracked in version control.
-
----
-
-## Configuration
-
-### Model Selection
-
-Model IDs follow the **LiteLLM naming convention**. Any provider supported by LiteLLM can be used without code changes:
-
-- `gpt-4o-mini` (OpenAI)
-- `claude-3-5-sonnet` (Anthropic)
-- `anthropic/claude-3-5-sonnet` (via Anthropic's API)
-- `openrouter/google/gemini-2.5-flash-lite` (via OpenRouter)
-- `ollama/llama3` (local Ollama)
-
-### Provider Modes
-
-#### Default Mode (Recommended)
-
-By default (`VCF_API_PROVIDER=default` or unset), LiteLLM auto-detects the provider from the model ID and uses that provider's standard environment variables:
-
-```dotenv
-VCF_API_PROVIDER=default        # (or omit this entirely)
-VCF_ARCHITECT_MODEL=openrouter/google/gemini-2.5-flash-lite
-VCF_REFEREE_MODEL=openrouter/google/gemini-2.5-flash-lite
-OPENROUTER_API_KEY=your-openrouter-api-key  # auto-detected from model ID
-VCF_REQUEST_TIMEOUT=60
-```
-
-#### AgentRouter Mode
-
-[AgentRouter](https://agentrouter.org) is an OpenAI-compatible gateway. To route VCF through it:
-
-```dotenv
-VCF_API_PROVIDER=agentrouter
-AGENTROUTER_API_KEY=sk-agentrouter-xxxxx
-VCF_API_BASE=https://agentrouter.org/v1
-VCF_ARCHITECT_MODEL=gpt-4o-mini
-VCF_REFEREE_MODEL=gpt-4o-mini
-VCF_REQUEST_TIMEOUT=60
-```
-
-With `VCF_API_PROVIDER=agentrouter`:
-- VCF calls LiteLLM with `api_key=AGENTROUTER_API_KEY` and `api_base=VCF_API_BASE`
-- Your `OPENAI_API_KEY` (if set) is **not** used for VCF calls
-- `AGENTROUTER_API_KEY` is **never** logged, printed, or written to diagnostics
-
-### Environment Variables Reference
-
-| Variable | Default | Purpose |
-|----------|---------|---------|
-| `VCF_ARCHITECT_MODEL` | `gpt-4o-mini` | Model ID for the Architect (draft generation) |
-| `VCF_REFEREE_MODEL` | `gpt-4o-mini` | Model ID for the Referee (validation) |
-| `VCF_REQUEST_TIMEOUT` | `60` | Per-call timeout in seconds |
-| `VCF_CONTEXT_MAX_CHARS` | `6000` | Max characters from project context file |
-| `VCF_ZED_DIR` | `.zed` | Output directory for prompts and diagnostics |
-| `VCF_API_PROVIDER` | `default` | Provider mode: `default` or `agentrouter` |
-| `VCF_API_BASE` | (none) | Required for `agentrouter` mode (e.g., `https://agentrouter.org/v1`) |
-| `AGENTROUTER_API_KEY` | (none) | API key for AgentRouter mode |
-
-### Project Context (SSOT)
-
-VCF automatically loads project context from the first file found, in order:
-
-1. `PROJECT_CONTEXT.md` (current directory)
-2. `docs/MEMORY.md`
-
-The context is truncated to `VCF_CONTEXT_MAX_CHARS` (default: 6000 characters) and injected into the Architect's prompt to provide project-specific knowledge.
-
-### Model Presets
-
-Model presets are convenience shortcuts that select a pre-defined Architect/Referee model pair in one step. They are especially useful for quickly switching between cost tiers or validation strength without remembering individual model IDs.
-
-| Preset | Architect | Referee | Best for |
-|--------|-----------|---------|----------|
-| `budget` | Gemini 2.5 Flash Lite | Gemini 2.5 Flash Lite | Fast, economical runs |
-| `balanced` | `VCF_ARCHITECT_MODEL` (env default) | `VCF_REFEREE_MODEL` (env default) | Equivalent to no preset |
-| `deepsense` | DeepSeek Chat | Claude 3.5 Sonnet | Strong cross-model checking |
-| `strict-judge` | GPT-4o-mini | Claude 3.5 Sonnet | Rigorous semantic validation |
-
-**Override priority (applied per field independently):**
-> Explicit `--architect-model` / `--referee-model` (CLI) or `architect_model` / `referee_model` (MCP) **always win** over any preset. You can mix a preset with a per-field override, e.g. use the `budget` preset but substitute a custom Referee.
-
----
-
-### External Presets (`presets.json`)
-
-In addition to the built-in presets above, you can define your own presets in a **`presets.json`** file at the project root. External presets are loaded automatically at startup and merged with the built-ins — external entries take precedence if they share a key name with a built-in.
-
-#### Schema
-
-Every entry in `presets.json` **must** contain all five keys:
-
-```json
-{
-  "my-preset": {
-    "architect": "auto/coding:free",
-    "referee": "auto/best-free",
-    "description": "Short human-readable description shown in the GUI",
-    "last_reviewed": "2026-08-11",
-    "notes": "Why this combo was chosen and when it should be revisited."
-  }
-}
-```
-
-| Key | Type | Required | Notes |
-|-----|------|----------|-------|
-| `architect` | string | ✅ | LiteLLM-compatible model ID for the Architect stage |
-| `referee` | string | ✅ | LiteLLM-compatible model ID for the Referee stage |
-| `description` | string | ✅ | One-line description shown in the GUI preset selector |
-| `last_reviewed` | string (ISO date) | ✅ | Date the preset was last validated against current model availability |
-| `notes` | string | ✅ | Rationale for the choice and any caveats |
-
-Any entry **missing** `last_reviewed` or `notes` is **skipped** with a warning log message. This is intentional: the LLM landscape changes monthly, and every preset that reaches production must have a paper trail of when it was last verified.
-
-#### Adding / Editing / Removing Presets
-
-- **Add**: Append a new JSON object to `presets.json` following the schema above.
-- **Edit**: Update the relevant fields and **update `last_reviewed` to today's date**.
-- **Remove**: Delete the entry. The built-in presets remain unaffected.
-- **Override a built-in**: Use the same key as a built-in preset (e.g. `"budget"`) — the external entry will replace it completely.
-
-#### Staleness Safeguard
-
-A preset is considered **stale** when today's date is more than **60 days** after its `last_reviewed` date. Stale presets cause:
-
-- A **visible warning** in the Streamlit GUI sidebar prompting you to re-verify the model IDs.
-- The `config.get_preset_staleness_days(preset_name)` helper returns the exact age in days, which can be used in automation scripts or CI checks.
-
-The 60-day threshold exists because model availability, routing aliases, and performance rankings change frequently — a preset that was optimal in June may route to a deprecated or downgraded model by September.
-
-#### Why `last_reviewed` and `notes` Are Mandatory
-
-The LLM landscape evolves rapidly: models are deprecated, renamed, repriced, or outperformed within weeks. Requiring `last_reviewed` and `notes` on every preset creates a lightweight audit trail that:
-
-1. Forces the author to document *why* a model pair was chosen.
-2. Makes it easy to spot presets that haven't been revisited recently.
-3. Supports automated staleness checks in CI without any network calls.
-
-#### Preset Maintenance
-
-> **Recommended cadence: every 4–6 weeks.**
-
-Before trusting a preset in production, verify the model IDs against current benchmarks and provider model lists:
-
-- **SWE-bench** (coding task evaluation): <https://www.swebench.com>
-- **LiveCodeBench** (live programming contests): <https://livecodebench.github.io>
-- Your proxy's `/v1/models` endpoint (the GUI does this automatically)
-
-After reviewing, update `last_reviewed` to today's date and revise `notes` to reflect any changes in the model landscape.
-
----
-
-### Dynamic Model Discovery (Streamlit GUI)
-
-The Streamlit GUI (`streamlit run gui.py`) automatically fetches the list of available models from the configured proxy endpoint on startup:
-
-```
-GET {VCF_API_BASE}/models        # when VCF_API_BASE ends with /v1
-GET {VCF_API_BASE}/v1/models     # otherwise
-```
-
-This is the same endpoint that OmniRoute (and any other OpenAI-compatible proxy) exposes. The response model IDs are displayed **exactly as returned** — no renaming, no filtering.
-
-#### URL Normalisation
-
-The GUI normalises the base URL to prevent the `/v1/v1/models` double-path bug:
-
-| `VCF_API_BASE` | Endpoint queried |
-|---|---|
-| `http://localhost:20128/v1` | `http://localhost:20128/v1/models` ✅ |
-| `http://localhost:20128` | `http://localhost:20128/v1/models` ✅ |
-| `http://localhost:20128/v1/` | `http://localhost:20128/v1/models` ✅ |
-
-#### Timeout and Fallback
-
-- The fetch uses a **3-second timeout**. If the proxy does not respond within that window, the GUI falls back to **manual text-input fields** — the same inputs that existed before this feature was added.
-- Any error (timeout, connection refused, non-200 status, malformed JSON) silently returns an empty model list and activates fallback mode.
-- The API key is sent in the `Authorization: Bearer` header but is **never logged, printed, or written to any file**.
-
-#### Staleness and Unavailability Warnings
-
-| Condition | GUI behaviour |
-|-----------|--------------|
-| Selected preset was last reviewed > 60 days ago | Orange `⏰` warning in sidebar |
-| Preset's model ID not in the fetched proxy list | Inline `⚠️` warning next to the model field |
-| Proxy unreachable / timeout | `⚠️ Proxy unavailable — manual model entry mode` status badge |
-| Proxy reachable | `✅ N models loaded from proxy` status badge |
-
-The **model unavailability warning** means the proxy you are connected to does not currently advertise that model ID. This does not guarantee the call will fail (the proxy might still route it), but it is a signal that the preset may be stale or misconfigured.
-
----
-
 ## CLI Usage
 
 ### Basic Invocation
@@ -335,7 +137,7 @@ This will:
 ```
 usage: vcf.py [-h] [--architect-model ARCHITECT_MODEL]
               [--referee-model REFEREE_MODEL] [--timeout TIMEOUT]
-              [--preset {budget,balanced,deepsense,strict-judge}]
+              [--project-root PROJECT_ROOT] [--preset PRESET]
               task
 
 positional arguments:
@@ -348,112 +150,14 @@ optional arguments:
   --referee-model REFEREE_MODEL
                         Override VCF_REFEREE_MODEL (always beats --preset)
   --timeout TIMEOUT     Override VCF_REQUEST_TIMEOUT (seconds)
-  --preset, -p {budget,balanced,deepsense,strict-judge}
-                        Model preset shortcut
+  --project-root PROJECT_ROOT
+                        Canonical project directory (defaults to VCF_PROJECT_ROOT
+                        or the startup directory)
+  --preset, -p PRESET   Model preset shortcut (built-in: budget, balanced,
+                        deepsense, strict-judge; plus any in presets.json)
 ```
 
-### Example Commands
-
-```sh
-# Default: use .env configuration
-python vcf.py "Refactor authentication logic"
-
-# Use a preset for a fast, cheap run
-python vcf.py "Add retry logic" --preset budget
-
-# Use a preset but override just the Referee for extra rigour
-python vcf.py "Add retry logic" --preset budget --referee-model claude-3-5-sonnet
-
-# Override models explicitly (ignores any preset)
-python vcf.py "Add unit tests" \
-  --architect-model anthropic/claude-3-5-sonnet \
-  --referee-model gpt-4o
-
-# Increase timeout for slower providers
-python vcf.py "Complex data migration" --timeout 120
-```
-
-### Output Files
-
-On **success** (status = `APPROVED`):
-- **`.zed/prompt.md`**: The final, validated prompt ready to paste into an AI IDE agent
-
-On **failure** (status = `REJECT` or `ERROR`):
-- **`.zed/review.md`**: Diagnostic information including:
-  - Task description
-  - All Architect drafts (JSON)
-  - All Referee reviews and critiques
-  - Error messages (if any)
-  - Feedback and required changes
-  - **`### 📊 Run Metrics`** — token usage and cost summary (see below)
-  - **`### 💡 Suggested Fallback Prompt`** — a ready-to-use prompt at the end of the file (see below)
-
-The existing `.zed/prompt.md` is **never** overwritten on failure, preserving the last approved prompt.
-
-A one-line token/cost summary is also printed to stdout at the end of every run, regardless of outcome:
-
-```
-[VCF] Tokens used: 1,420 | Est. cost: $0.00035
-```
-
-If no usage data was available (e.g. a mock response without a `.usage` attribute), this line instead reads:
-
-```
-[VCF] Tokens used: unavailable
-```
-
-#### Run Metrics
-
-Every `review.md` produced on a `REJECT` or `ERROR` path includes a
-`### 📊 Run Metrics` section positioned immediately before the Suggested
-Fallback Prompt. The section contains:
-
-- **Total token counts** — prompt tokens, completion tokens, and total tokens
-  summed across every LLM call made during the run (including any JSON-repair
-  calls).
-- **Estimated cost in USD** — computed via `litellm.completion_cost()`, formatted
-  to preserve small values (e.g. `$0.00042` not `$0.00`). Defaults to `$0.00000`
-  if pricing data is unavailable for the model.
-- **Per-stage breakdown** (when more than one call occurred) — one row per call
-  with stage label, model, per-call token counts, and per-call cost.
-
-If no usage data was available for any call during the run (e.g. all responses
-lacked a `.usage` attribute), the section renders:
-
-> No token/cost data available for this run.
-
-Partial metrics from calls that succeeded before an error are preserved even on
-the `ERROR` path — they are never silently discarded.
-
-#### Suggested Fallback Prompt
-
-Every `review.md` produced on a `REJECT` or `ERROR` path ends with a
-`### 💡 Suggested Fallback Prompt` section containing a ready-to-copy starting
-point. The fallback is resolved using the following priority hierarchy:
-
-1. **Referee suggestion** — if the Referee returned a `suggested_prompt` field
-   in its final review, that complete corrected prompt is used verbatim.
-2. **Last Architect draft** — if no Referee suggestion was provided, the last
-   `ArchitectDraft.zed_prompt` produced during the run is used as a baseline
-   for manual editing.
-3. **No-fallback sentinel** — if the pipeline failed before the first Architect
-   draft was completed (e.g. an API authentication error or network timeout),
-   the section renders:
-   > *No fallback available — rerun with a more specific task description or verify API credentials.*
-
-The fallback prompt is wrapped in a fenced Markdown code block for instant
-copy-pasting. It is never the content of `.zed/prompt.md` — that file is only
-written on `APPROVED` status.
-
----
-
-## Exit Codes
-
-| Code | Status | Meaning |
-|------|--------|---------|
-| `0` | `APPROVED` | Prompt was successfully validated and written to `.zed/prompt.md` |
-| `1` | `REJECT` | Prompt was rejected by the Referee after one fix attempt |
-| `1` | `ERROR` | LLM call failed, invalid JSON, timeout, or filesystem error |
+More CLI examples: [Example Commands](docs/REFERENCE.md#example-commands).
 
 ---
 
@@ -475,6 +179,8 @@ This will automatically open the web interface in your default browser (default:
 - **Preset Selection**: Select model presets (`budget`, `balanced`, `deepsense`, `strict-judge`) from the sidebar.
 - **Custom Model Overrides**: Optionally override Architect or Referee models independently.
 - **Native Click-to-Copy Output**: Approved prompts and suggested fallback prompts are rendered in Markdown code blocks featuring native copy buttons.
+- **History Browser**: Switch the sidebar view to browse previously saved validation runs.
+- **Validate External Agent Output**: Independently review output from another agent against the original task.
 - **Run Metrics & Diagnostics**: View token counts, estimated costs, and detailed Referee reviews inside collapsible expanders.
 
 ---
@@ -493,71 +199,7 @@ Run a specific test:
 pytest tests/test_vcf.py::TestApprovedFlow::test_approved_on_first_pass -v
 ```
 
-### Test Coverage
-
-- **41 comprehensive unit tests** in `tests/test_vcf.py` and **12 MCP server tests** in `tests/test_mcp_server.py` (**53 total**), plus **7 unit tests** for `record_memory_entry`, **4 MCP tests** for `record_verified_outcome`, **11 preset resolution tests**, **2 pipeline preset integration tests**, **3 CLI preset tests**, **3 MCP preset passthrough tests**, and **8 GUI unit tests** (**91 total**) covering:
-  - Approved flow (first pass and after one fix cycle)
-  - Reject flow (after fix attempt, prompt preservation)
-  - JSON repair (malformed responses, recovery)
-  - Contract validation (structural checks)
-  - Filesystem isolation (`.zed/` directory creation)
-  - Provider configuration (default and AgentRouter modes)
-  - Error handling (LLM failures, timeouts)
-  - Suggested Fallback Prompt resolution (Referee suggestion, last draft, no-fallback sentinel)
-  - **Cost & Token Tracking** — accumulation across multiple calls, JSON-repair call inclusion, graceful fallback when no usage data, `### 📊 Run Metrics` section presence and ordering, partial metrics preserved on error path, CLI summary line
-
-All tests are **fully isolated**: no real LLM calls, no real network I/O. LiteLLM is monkeypatched with `AsyncMock`, and filesystem operations use pytest's `tmp_path` fixture.
-
----
-
-## Architecture Notes
-
-### Stateless Design
-
-- Every function accepts explicit parameters (models, timeouts, directories) instead of relying on global state
-- No persistent cache or session management
-- Safe to run in parallel; no race conditions
-- Easily unit-testable with mocked LLM responses
-
-### Contract Validation
-
-- **Structural validation** (deterministic control flow, no LLM call):  
-  Checks that all four required Markdown headings are present, in order, each with non-empty content. This check is deterministic and produces consistent results.
-  
-- **Semantic validation** (performed by the Referee LLM):  
-  Detects meta-prompts, contradictions, invented project facts, vagueness, and safety concerns. Results may vary between runs due to LLM non-determinism.
-
-The two-stage validation prevents invalid prompts from reaching the IDE agent and allows the pipeline to reject structurally invalid drafts without spending an LLM call.
-
-### Referee Anti-bias Calibration
-
-The `REFEREE_SYSTEM_PROMPT` includes an explicit **anti-bias calibration paragraph** added after the Prompt Contract v1 rejection rules:
-
-> *Act as an unsparing, independent technical editor. A draft's fluency, length, or confident tone is not evidence of correctness — evaluate it solely against the concrete Prompt Contract v1 rules listed above. Do not assume the Architect is correct merely because its output looks well-structured or uses sophisticated phrasing; conversely, do not penalise a draft for being terse if it is otherwise fully compliant and correct. Judge content purely against Prompt Contract v1 criteria, regardless of which underlying model produced the draft or how that model's writing style differs from other models.*
-
-This is particularly important when using cross-model presets like `deepsense` or `strict-judge`, where the Referee and Architect are from different model families and have different stylistic tendencies.
-
-### Suggested Fallback Prompt
-
-On every `REJECT` or `ERROR` path, `_format_review_markdown` appends a
-`### 💡 Suggested Fallback Prompt` section to `.zed/review.md`. The content is
-resolved from a three-level hierarchy (Referee `suggested_prompt` → last
-Architect draft → no-fallback sentinel) implemented in `_resolve_fallback_prompt`.
-
-- The Referee is instructed to populate `suggested_prompt` with a complete,
-  Prompt Contract v1-compliant corrected prompt whenever it issues a `REJECT`.
-- The field is optional (`str | None = None`) in `RefereeReview` so existing
-  clients that omit it continue to work unchanged.
-- Secrets and environment variable values are **never** included: the fallback
-  is derived solely from LLM-generated text already present in `diagnostic_info`.
-
-### Fix Cycle
-
-- Only **one fix cycle** is allowed (Architect gets one chance to correct feedback)
-- If the Referee rejects the second draft, the pipeline fails with status `REJECT`
-- This prevents infinite loops and keeps costs predictable
-
----
+The suite (258 tests at the time of writing) runs fully offline; coverage details are in [docs/REFERENCE.md](docs/REFERENCE.md#test-coverage).
 
 ## MCP Server
 
@@ -565,191 +207,10 @@ VCF ships a [Model Context Protocol](https://spec.modelcontextprotocol.io) serve
 (`mcp_server.py`) that exposes the pipeline as a callable tool named
 `refine_prompt`.  IDE agents (Zed, Cursor, Antigravity) can invoke VCF directly
 without the user running `python vcf.py` manually or copy-pasting
-`.zed/prompt.md`.
-
-### `refine_prompt` Tool
-
-**Description:** Runs the full Architect → Referee → fix-cycle pipeline on a
-raw task description and returns a structured result.
-
-**Parameters:**
-
-| Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
-| `task` | `str` | *(required)* | The raw user task description |
-| `architect_model` | `str \| null` | env default | LiteLLM model ID for the Architect |
-| `referee_model` | `str \| null` | env default | LiteLLM model ID for the Referee |
-| `timeout` | `float \| null` | env default | Per-call LLM timeout in seconds |
-| `context_dir` | `str` | `"."` | Directory to load project context from |
-
-**Return shape:**
-
-```json
-{
-  "status":       "APPROVED" | "REJECT" | "ERROR",
-  "final_prompt": "<approved prompt text>" | null,
-  "summary":      "[VCF] Tokens used: 1,420 | Est. cost: $0.00035",
-  "details_path": "/abs/path/to/.zed/prompt.md",
-  "error":        null
-}
-```
-
-- `details_path` points to `.zed/prompt.md` on `APPROVED`, `.zed/review.md` on `REJECT`/`ERROR`.  
-  The calling IDE agent can read this file directly for full diagnostic detail.
-- API keys and secrets are **never** included in the returned dict.
-
----
-
-### `record_verified_outcome` Tool
-
-> ⚠️ **This tool must ONLY be called after real, verified implementation work.**
-> It must NEVER be called immediately after `refine_prompt` returns a prompt.
-> A prompt is a specification to be executed — not a completed implementation.
-
-**Description:** Appends a structured, dated entry to `docs/MEMORY.md` recording
-the outcome of a completed and verified implementation task. This file accumulates
-over time and is automatically read as project context (SSOT) on future
-`refine_prompt` runs via the existing `load_ssot_context` fallback order
-(`PROJECT_CONTEXT.md` first, then `docs/MEMORY.md`). No additional wiring is required.
-
-**The correct calling sequence is:**
-1. Call `refine_prompt` → get a validated prompt.
-2. The IDE agent (or a human) executes that prompt and implements the change.
-3. Tests run and pass (or the outcome is otherwise confirmed).
-4. **Only then** call `record_verified_outcome` to record what happened.
-
-**Parameters:**
-
-| Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
-| `task` | `str` | *(required)* | Short description of the implemented task (becomes the entry heading) |
-| `outcome` | `str` | *(required)* | One of `"verified_success"`, `"verified_partial"`, or `"abandoned"` |
-| `notes` | `str` | *(required)* | Free-text notes. **Do NOT include API keys or secrets** — written verbatim to a tracked file |
-| `files_touched` | `list[str] \| null` | `null` | Optional list of file paths created or modified |
-
-**Return shape:**
-
-On success:
-```json
-{ "status": "OK", "memory_path": "/abs/path/to/docs/MEMORY.md" }
-```
-
-On error (invalid outcome or file write failure):
-```json
-{ "status": "ERROR", "error": "<human-readable message>" }
-```
-
-**`docs/MEMORY.md` entry format:**
-
-```markdown
-## 2026-08-07 — Add retry logic to connection handler
-
-- **Outcome:** verified_success
-- **Notes:** All 53 tests pass. No regressions.
-- **Files touched:** `orchestrator.py`, `mcp_server.py`
-```
-
-Entries are appended chronologically (most-recent-last), so the file reads as a
-human-friendly history of confirmed project changes.
-
-### Running the Server
-
-For local testing (starts the stdio JSON-RPC server; exit with `Ctrl+C`):
-
-```sh
-python mcp_server.py
-```
-
-The server produces no stdout output when idle — all logging goes to stderr.
-
-### Registering in Zed
-
-Add the following to your Zed `settings.json` (adjust the path to the
-actual location of your `prompt-refinery` checkout):
-
-```json
-{
-  "context_servers": {
-    "prompt-refinery": {
-      "command": {
-        "path": "python",
-        "args": ["/absolute/path/to/prompt-refinery/mcp_server.py"]
-      }
-    }
-  }
-}
-```
-
-### Other MCP-Compatible IDEs
-
-The same `{ "command": { "path": "python", "args": [...] } }` pattern works for
-Cursor, Antigravity, and any other MCP-compatible IDE — only the settings file
-location differs.  Consult your IDE's MCP integration documentation for the
-exact configuration format.
-
----
-
-## Dependencies
-
-- **Python 3.11+**
-- **pydantic** (data validation)
-- **litellm** (LLM provider abstraction)
-- **mcp** (MCP Python SDK, 2.0+, for the `mcp_server.py` stdio server)
-- **python-dotenv** (environment variable loading)
-- **pytest** (testing framework; dev dependency)
-
-See `requirements.txt` for pinned versions.
-
----
+`.zed/prompt.md`. Setup, tool reference and IDE registration: see [Reference](#reference).
 
 ## License & Contributing
 
 This project is part of the Prompt Refinery ecosystem. Contributions are welcome; please ensure all tests pass before submitting a pull request.
 
 ---
-
-## Troubleshooting
-
-### "Unsupported VCF_API_PROVIDER"
-
-Make sure `VCF_API_PROVIDER` is set to `default` or `agentrouter` (case-insensitive).
-
-### "Prompt was rejected by the Referee"
-
-Check `.zed/review.md` for the Referee's critique and required changes. The Architect will attempt one fix; if it still fails, you may need to refine the task description or project context.
-
-### "LLM call failed"
-
-- Verify your API key is set correctly and has valid credentials
-- Check `VCF_REQUEST_TIMEOUT` is reasonable for your network
-- For AgentRouter, ensure both `AGENTROUTER_API_KEY` and `VCF_API_BASE` are set
-
-### "JSON validation failed after 1 repair attempt"
-
-The model returned malformed JSON even after repair instructions. Try:
-- Using a different model (smaller models may struggle)
-- Increasing `VCF_REQUEST_TIMEOUT`
-- Simplifying your task description
-
----
-
-## Quick Reference
-
-```sh
-# Install
-pip install -r requirements.txt
-
-# Configure
-cp .env.example .env
-# Edit .env with your API keys and model choices
-
-# Run
-python vcf.py "Your task description here"
-
-# Check result
-cat .zed/prompt.md        # on success
-cat .zed/review.md        # on failure
-
-# Test
-pytest tests/ -v
-```
